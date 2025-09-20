@@ -28,11 +28,23 @@
 
 ## 🚀 快速开始
 
-当前项目处于理论构建和初始规划阶段，尚未开始代码实现。
+当前项目已进入原型实现阶段。你可以直接生成地形并导出标准化 NetCDF，再进行可视化检查。
 
-1.  **了解世界观**: 阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md) 来了解“青黛”世界的基础设定。
-2.  **理解物理模型**: 浏览 [docs/02-orbital-dynamics.md](./docs/02-orbital-dynamics.md) 和 [docs/03-climate-model.md](./docs/03-climate-model.md) 来理解其背后的科学原理。
-3.  **查看项目规划**: 阅读 [projects/001-genesis.md](./projects/001-genesis.md) 来了解我们的开发路线图。
+- 安装依赖：
+  - `python3 -m ensurepip --upgrade`
+  - `python3 -m pip install -r requirements.txt`
+- 生成地形与多字段 NetCDF（默认 181x360, seed=42, 目标陆比 0.29）：
+  - `python3 -m scripts.generate_topography`
+  - 输出目录：`data/`，示例：`topography_qingdai_181x360_seed42_YYYYMMDDTHHMMSSZ.nc`
+- 基本可视化（自动选择 data 下最新 nc）：
+  - `python3 -m scripts.plot_topography`
+  - 将在 `data/` 生成对应的 `*_overview.png`
+
+参考阅读：
+1.  **了解世界观**: 阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)
+2.  **理解物理模型**: 浏览 [docs/02-orbital-dynamics.md](./docs/02-orbital-dynamics.md) 和 [docs/03-climate-model.md](./docs/03-climate-model.md)
+3.  **查看项目规划**: 阅读 [projects/001-genesis.md](./projects/001-genesis.md)
+4.  **当前项目状态与设计细节（P004）**: [projects/004-topography-generation.md](./projects/004-topography-generation.md)
 
 ## 🤝 贡献
 
