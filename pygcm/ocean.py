@@ -51,8 +51,13 @@ class WindDrivenSlabOcean:
 
         # Drag / wind stress
         self.CD = float(os.getenv("QD_CD", "1.5e-3"))          # air-ocean drag coefficient
-        self.r_bot = float(os.getenv("QD_R_BOT", "1.0e-6"))     # bottom drag (s^-1)
+        self.r_bot = float(os.getenv("QD_R_BOT", "2.0e-5"))     # bottom drag (s^-1) stronger default for slab ocean
         self.rho_a = float(os.getenv("QD_RHO_A", "1.2"))        # air density for wind stress
+        self.vcap = float(os.getenv("QD_WIND_STRESS_VCAP", "15.0"))  # cap for wind speed in stress (m/s)
+        self.tau_scale = float(os.getenv("QD_TAU_SCALE", "0.2"))     # momentum transfer efficiency to slab
+        # Polar sponge (extra drag near poles)
+        self.polar_lat0 = float(os.getenv("QD_POLAR_SPONGE_LAT", "70.0"))   # deg
+        self.polar_gain = float(os.getenv("QD_POLAR_SPONGE_GAIN", "5.0e-5")) # s^-1 at pole
 
         # Mixing / dissipation
         self.K_h = float(os.getenv("QD_KH_OCEAN", "5.0e3"))     # lateral mixing of SST (m^2/s)
@@ -64,14 +69,14 @@ class WindDrivenSlabOcean:
 
         # CFL guard (diagnostic)
         self.cfl_target = float(os.getenv("QD_OCEAN_CFL", "0.5"))
-        self.max_u_cap = float(os.getenv("QD_OCEAN_MAX_U", "3.0e2"))  # sanity cap
+        self.max_u_cap = float(os.getenv("QD_OCEAN_MAX_U", "10.0"))  # sanity cap (ocean currents)
 
         # Grid metrics
         self.a = const.PLANET_RADIUS
         self.dlat = self.grid.dlat_rad
         self.dlon = self.grid.dlon_rad
         self.lat_rad = np.deg2rad(self.grid.lat_mesh)
-        self.coslat = np.maximum(np.cos(self.lat_rad), 0.2)  # guard near poles (strong cap to avoid metric blow-up)
+        self.coslat = np.maximum(np.cos(self.lat_rad), 0.5)  # stronger cap to avoid polar metric blow-up
         self.f = self.grid.coriolis_param
 
         # Prognostic fields
@@ -171,8 +176,9 @@ class WindDrivenSlabOcean:
 
         # Precompute wind stress for this step (kept constant within substeps)
         Va = np.sqrt(u_atm**2 + v_atm**2)
-        tau_x = self.rho_a * self.CD * Va * u_atm
-        tau_y = self.rho_a * self.CD * Va * v_atm
+        Va_eff = np.minimum(Va, self.vcap)
+        tau_x = self.tau_scale * (self.rho_a * self.CD * Va_eff * u_atm)
+        tau_y = self.tau_scale * (self.rho_a * self.CD * Va_eff * v_atm)
 
         # Determine stable substeps based on gravity wave and advective CFL
         dx_lat = self.a * self.dlat
@@ -212,6 +218,16 @@ class WindDrivenSlabOcean:
             self.uo[on_land] = 0.0
             self.vo[on_land] = 0.0
 
+            # Polar sponge: extra drag toward poles to suppress unrealistically fast polar currents
+            try:
+                lat_deg = np.abs(np.rad2deg(self.lat_rad))
+                s = np.clip((lat_deg - self.polar_lat0) / max(1e-6, 90.0 - self.polar_lat0), 0.0, 1.0)
+                r_extra = self.polar_gain * (s ** 2)  # smooth increase to pole
+                self.uo -= sub_dt * r_extra * self.uo
+                self.vo -= sub_dt * r_extra * self.vo
+            except Exception:
+                pass
+
             # 4) Scale-selective dissipation (cadence tied to outer step)
             if (self.diff_every > 0) and (self._step % self.diff_every == 0):
                 k4_base = self.sigma4 * (dx_min**4) / max(1e-12, sub_dt)
@@ -229,6 +245,16 @@ class WindDrivenSlabOcean:
             div = self.grid.divergence(self.uo, self.vo)
             self.eta += - sub_dt * self.H * div
             self.eta[on_land] = 0.0
+            # Remove area-weighted ocean mean to avoid drift
+            try:
+                ocean_mask = (self.land_mask == 0)
+                if np.any(ocean_mask):
+                    w = np.maximum(np.cos(self.lat_rad), 0.0)
+                    w_o = w * ocean_mask
+                    eta_mean = float(np.sum(self.eta * w_o) / (np.sum(w_o) + 1e-15))
+                    self.eta -= eta_mean
+            except Exception:
+                pass
 
             # 6) SST advection by ocean currents (semi-Lagrangian, gentle blend)
             adv_alpha = float(os.getenv("QD_OCEAN_ADV_ALPHA", "0.7"))  # 0..1
@@ -254,7 +280,7 @@ class WindDrivenSlabOcean:
             self.vo = np.clip(np.nan_to_num(self.vo), -self.max_u_cap, self.max_u_cap)
             self.eta = np.nan_to_num(self.eta)
             # Clamp eta to a safe anomaly range (meters) to prevent runaway
-            _eta_cap = float(os.getenv("QD_ETA_CAP", "200.0"))
+            _eta_cap = float(os.getenv("QD_ETA_CAP", "5.0"))
             self.eta = np.clip(self.eta, -_eta_cap, _eta_cap)
             self.Ts = np.nan_to_num(self.Ts)
 
