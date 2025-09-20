@@ -30,12 +30,50 @@
     由于模型没有湿度变量，我们设计一个**“动力-降水”诊断方案**。我们假设大规模降水发生在空气强烈辐合的区域。
 
     1.  **计算散度**: 在每个时间步，计算风场的水平散度场 $D$。
-    2.  **诊断降水**: 当散度为负（即辐合）且其强度超过某个阈值 $D_{crit}$ 时，就以一定概率产生降水。降水率 $P$ 可以与辐合强度成正比：
+    2.  **诊断降水（平滑坡度）**: 用连续函数代替硬阈值，避免方块伪迹并增强与动力的一致性：
         $$
-        P =
-        \begin{cases}
-        -k \cdot D & \text{if } D < D_{crit} \\
-        0 & \text{otherwise}
-        \end{cases}
+        P \;=\; k_{\mathrm{precip}}\;\max\!\bigl(0,\; D_{\mathrm{crit}} - D \bigr)
         $$
-        这个降水场 $P$ 就构成了地表水分的来源。
+        - 默认不再使用“由云量门控降水”的硬阈值；主循环中对 `diagnose_precipitation` 关闭 `cloud_threshold`，避免因果倒置。
+        - 可选地对 $P$ 做轻度高斯平滑去除像素级伪迹（代码默认 $\sigma\approx1$ 个格点）。
+
+    3.  **由降水诊断云量（饱和型正相关）**：
+        $$
+        C \;=\; C_{\max}\,\tanh\!\left(\frac{P}{P_{\mathrm{ref}}}\right),\qquad C\in[0,1]
+        $$
+        - $C_{\max}$ 默认为 0.95（可用环境变量 `QD_CMAX` 调整）。
+        - 参考尺度 $P_{\mathrm{ref}}$ 默认取“正降水像元的中位数”（可用环境变量 `QD_PREF` 指定，典型 $10^{-5}\!\sim\!10^{-4}$，视单位与场强）。
+        - 对 $C$ 做轻度高斯平滑（$\sigma\approx1$）以避免块状边缘。
+
+    4.  **额外的云源项（气候学启发）**（`parameterize_cloud_cover`）：
+        - 基于地表温度的蒸发/凝结代理（tanh 连续函数，应用于全域，不再对海陆做硬掩膜）。
+        - 相对涡度（$\,\zeta/f\,$）提升的抬升源项（平滑阈值）。
+        - $\lvert \mathbf{V}\cdot\nabla T\rvert$ 作为锋生代理（平滑阈值）。
+        - 三者相加后再做轻度平滑与截断到 $[0,1]$。
+
+    5.  **云量融合（保留记忆 + 强耦合降水 + 背景源）**：
+        $$
+        C^{(n+1)} \;=\; w_{\mathrm{mem}}\,C^{(n)} \;+\; w_{P}\,C(P)\;+\; w_{\mathrm{src}}\;\mathrm{clip}\!\left(C^{(n)} + S_{\mathrm{cloud}}\frac{\Delta t}{6\,\mathrm{h}},\,0,\,1\right)
+        $$
+        - 权重默认 $(w_{\mathrm{mem}}, w_P, w_{\mathrm{src}})=(0.4,\,0.4,\,0.2)$，可用环境变量 `QD_W_MEM`、`QD_W_P`、`QD_W_SRC` 调整（自动归一化）。
+        - 该融合使“强降水区 → 高云量”的直觉得到保证，同时保留云的时间记忆与背景生成。
+
+    6.  **反照率耦合**：
+        - 动态反照率采用
+          $$
+          \alpha \;=\; \alpha_{\mathrm{surface}}(T_s)\,(1-C) \;+\; \alpha_{\mathrm{cloud}}\,C,
+          $$
+          其中 $\alpha_{\mathrm{surface}}$ 随地表温度体现冰-反照率反馈；$C$ 来自上述融合云量。
+
+## 3.4 数值稳定性与动力实现细节
+
+- **赤道 $f$ 正则化**：保证 $|f|$ 不小于 $|\;2\Omega\sin(5^\circ)\;|$ 且保持符号，消除除零/病态放大（`pygcm/dynamics.py`）。
+- **地转风钳制**：$|u_g|,|v_g| \le 200\,\mathrm{m\,s^{-1}}$ 防止数值爆裂。
+- **地表温度半拉氏平流**：用半拉氏方案对 $T_s$ 做轻混合（权重≈0.2），增强热平流与非纬向性。
+- **全局扩散**：温和扩散因子≈0.995（先前 0.95），兼顾稳定与结构保持。
+- **云寿命**：经验性 2 天 e-folding（缓解过快消散）。
+- **地表摩擦**：使用海陆差异摩擦图（`pygcm/topography.generate_base_properties`），陆地强、海洋弱。
+- **运行控制（环境变量）**：
+  - `QD_SIM_DAYS`、`QD_PLOT_EVERY_DAYS`、`QD_DT_SECONDS`：积分时长 / 出图频率 / 步长。
+  - `QD_CMAX`、`QD_PREF`：云-雨关系参数（$C_{\max}$、$P_{\mathrm{ref}}$）。
+  - `QD_W_MEM`、`QD_W_P`、`QD_W_SRC`：云量融合权重。

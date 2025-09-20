@@ -3,4 +3,6 @@ name = "qingdai"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "scipy-stubs==1.16.2.0",
+]
