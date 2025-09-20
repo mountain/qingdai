@@ -117,6 +117,84 @@ def longwave_radiation(Ts: np.ndarray, Ta: np.ndarray, cloud: np.ndarray, params
     return LW_atm, LW_sfc, OLR, DLR, eps
 
 
+# ---------------- P006 extensions: cloud-optical-aware LW and surface emissivity (optional) ----------------
+def surface_emissivity_map(land_mask: np.ndarray,
+                           ice_frac: np.ndarray | float) -> np.ndarray:
+    """
+    Build a per-grid surface emissivity map ε_sfc dependent on surface type.
+    Defaults are physically plausible and can be tuned via env:
+      QD_EPS_OCEAN (default 0.98), QD_EPS_LAND (0.96), QD_EPS_ICE (0.99)
+    """
+    import numpy as _np
+    eps_ocean = float(os.getenv("QD_EPS_OCEAN", "0.98"))
+    eps_land  = float(os.getenv("QD_EPS_LAND",  "0.96"))
+    eps_ice   = float(os.getenv("QD_EPS_ICE",   "0.99"))
+    land = (land_mask == 1)
+    ocean = ~land
+    eps = _np.full_like(ice_frac, eps_land, dtype=float)
+    eps[ocean] = eps_ocean
+    # Where ocean has sea-ice, blend towards ε_ice by optical ice_frac
+    eps[ocean] = (1.0 - _np.clip(ice_frac[ocean], 0.0, 1.0)) * eps_ocean + _np.clip(ice_frac[ocean], 0.0, 1.0) * eps_ice
+    return _np.nan_to_num(eps, copy=False)
+
+
+def longwave_radiation_v2(Ts: np.ndarray,
+                          Ta: np.ndarray,
+                          cloud_eff: np.ndarray,
+                          eps_sfc: np.ndarray | float,
+                          params: EnergyParams,
+                          *,
+                          tau0: float | None = None,
+                          k_tau: float | None = None):
+    """
+    Cloud-optical-aware single-layer LW with surface emissivity.
+    Idea:
+      - clear-sky emissivity: eps_clear = clip(lw_eps0,0,1)
+      - cloud emissivity:     eps_cloud = 1 - exp(-k_tau * tau_cloud), tau_cloud = tau0 * cloud_eff
+      - effective eps:        eps_eff = 1 - (1 - eps_clear) * (1 - eps_cloud)
+      - surface emissivity map ε_sfc (ocean/land/ice) enters σ ε_sfc Ts^4
+
+    Returns: (LW_atm, LW_sfc, OLR, DLR, eps_eff)
+    """
+    sigma = const.SIGMA
+    Ts = np.maximum(0.0, Ts)
+    Ta = np.maximum(0.0, Ta)
+    Ts4 = Ts ** 4
+    Ta4 = Ta ** 4
+
+    # Params
+    eps_clear = np.clip(float(params.lw_eps0), 0.0, 1.0)
+    tau0 = float(os.getenv("QD_LW_TAU0", "6.0")) if tau0 is None else float(tau0)
+    k_tau = float(os.getenv("QD_LW_KTAU", "1.0")) if k_tau is None else float(k_tau)
+
+    # Cloud optical depth and corresponding LW emissivity
+    cloud_eff = np.clip(cloud_eff, 0.0, 1.0)
+    tau_cloud = tau0 * cloud_eff
+    eps_cloud = 1.0 - np.exp(-k_tau * tau_cloud)
+    eps_cloud = np.clip(eps_cloud, 0.0, 1.0)
+
+    # Combine clear and cloud contributions to effective atmospheric LW emissivity
+    eps_eff = 1.0 - (1.0 - eps_clear) * (1.0 - eps_cloud)
+
+    # Surface emissivity map (can be scalar)
+    if np.isscalar(eps_sfc):
+        eps_sfc_arr = np.full_like(Ts, float(eps_sfc))
+    else:
+        eps_sfc_arr = np.clip(np.nan_to_num(eps_sfc, copy=False), 0.0, 1.0)
+
+    # Flux partitions
+    # TOA OLR: part from atmosphere + transmitted surface emission
+    OLR = eps_eff * sigma * Ta4 + (1.0 - eps_eff) * sigma * eps_sfc_arr * Ts4
+    # Downward longwave to surface
+    DLR = eps_eff * sigma * Ta4
+    # Net on surface
+    LW_sfc = DLR - sigma * eps_sfc_arr * Ts4
+    # Net on atmosphere: absorbed from surface minus its up+down emission
+    LW_atm = eps_eff * (sigma * eps_sfc_arr * Ts4 - 2.0 * sigma * Ta4)
+
+    return LW_atm, LW_sfc, OLR, DLR, eps_eff
+
+
 def integrate_surface_energy(Ts: np.ndarray,
                              SW_sfc: np.ndarray,
                              LW_sfc: np.ndarray,

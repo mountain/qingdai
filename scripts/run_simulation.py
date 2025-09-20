@@ -21,14 +21,25 @@ from pygcm.dynamics import SpectralModel
 from pygcm.topography import create_land_sea_mask, generate_base_properties, load_topography_from_netcdf
 from pygcm.physics import diagnose_precipitation, parameterize_cloud_cover, calculate_dynamic_albedo, cloud_from_precip, compute_orographic_factor
 from pygcm.hydrology import get_hydrology_params_from_env, partition_precip_phase, snow_step, update_land_bucket, diagnose_water_closure
+from pygcm import energy as energy
+from pygcm.ocean import WindDrivenSlabOcean
 
-def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output_dir):
+def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output_dir, ocean=None):
     """
     Generates and saves a plot of the current model state.
     """
-    fig, axes = plt.subplots(4, 2, figsize=(18, 20), constrained_layout=True)
-    fig.suptitle(f"Qingdai GCM State at Day {t_days:.2f}", fontsize=16)
-    ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8 = axes.flatten()
+    # Layout: if ocean is provided, add two panels (SST and ocean currents)
+    if ocean is None:
+        fig, axes = plt.subplots(4, 2, figsize=(18, 20), constrained_layout=True)
+        fig.suptitle(f"Qingdai GCM State at Day {t_days:.2f}", fontsize=16)
+        ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8 = axes.flatten()
+        ax9 = ax10 = None
+    else:
+        fig, axes = plt.subplots(5, 2, figsize=(18, 24), constrained_layout=True)
+        fig.suptitle(f"Qingdai GCM State at Day {t_days:.2f}", fontsize=16)
+        a = axes.flatten()
+        ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8 = a[0:8]
+        ax9, ax10 = a[8], a[9]
 
     # 1. Plot Surface Temperature and Land Mask
     ts_plot = ax1.contourf(grid.lon, grid.lat, gcm.T_s - 273.15, levels=20, cmap='coolwarm')
@@ -91,6 +102,31 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
     ax8.set_title("Outgoing Longwave (W/m^2)")
     fig.colorbar(olr_plot, ax=ax8, label="W/m^2")
 
+    # 9. SST (°C) if ocean enabled
+    if ocean is not None and ax9 is not None:
+        sst_c = np.nan_to_num(ocean.Ts - 273.15)
+        sst_plot = ax9.contourf(grid.lon, grid.lat, sst_c, levels=20, cmap='coolwarm')
+        ax9.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=0.7)
+        ax9.set_title("SST (°C)")
+        fig.colorbar(sst_plot, ax=ax9, label="°C")
+
+    # 10. Ocean surface currents if ocean enabled
+    if ocean is not None and ax10 is not None:
+        speed_o = np.sqrt(np.nan_to_num(ocean.uo)**2 + np.nan_to_num(ocean.vo)**2)
+        sp_plot = ax10.contourf(grid.lon, grid.lat, speed_o, levels=20, cmap='viridis')
+        # Subsampled quiver for readability
+        step_lat = max(1, grid.n_lat // 30)
+        step_lon = max(1, grid.n_lon // 30)
+        lon_q = grid.lon_mesh[::step_lat, ::step_lon]
+        lat_q = grid.lat_mesh[::step_lat, ::step_lon]
+        uo_q = np.nan_to_num(ocean.uo[::step_lat, ::step_lon])
+        vo_q = np.nan_to_num(ocean.vo[::step_lat, ::step_lon])
+        ax10.quiver(lon_q, lat_q, uo_q, vo_q, color='white', scale=400, width=0.002)
+        ax10.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=0.7)
+        ax10.set_title("Ocean Currents (m/s)")
+        fig.colorbar(sp_plot, ax=ax10, label="m/s")
+
+    # Axes cosmetics
     for ax in axes.flatten():
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
@@ -105,41 +141,114 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
 def plot_true_color(grid, gcm, land_mask, t_days, output_dir):
     """
     Generates and saves a pseudo-true-color plot of the planet.
+
+    Notes:
+    - Sea-ice is now rendered from thickness (h_ice → optical ice_frac), NOT by T_s threshold,
+      to be consistent with diagnostics与反照率。
+    - Clouds are blended with configurable opacity，避免“整片纯白误判为冰”。
     """
-    # Define colors
-    ocean_color = np.array([0.1, 0.2, 0.5])
-    land_color = np.array([0.4, 0.3, 0.2])
-    ice_color = np.array([0.9, 0.9, 0.95])
-    
-    # Create base map (land/ocean/ice)
-    rgb_map = np.zeros((grid.n_lat, grid.n_lon, 3))
-    
-    # Ocean
+    # Base colors
+    ocean_color = np.array([0.10, 0.20, 0.50])
+    land_color  = np.array([0.40, 0.30, 0.20])
+    ice_color   = np.array([0.90, 0.90, 0.95])
+
+    # Initialize RGB map
+    rgb_map = np.zeros((grid.n_lat, grid.n_lon, 3), dtype=float)
     rgb_map[land_mask == 0] = ocean_color
-    # Land
     rgb_map[land_mask == 1] = land_color
-    # Ice
-    rgb_map[gcm.T_s < 273.15] = ice_color
-    
-    # Add clouds (as a white layer)
-    # The cloud layer is semi-transparent, so we blend it
+
+    # Sea-ice from thickness (optical fraction)
+    H_ice_ref = float(os.getenv("QD_HICE_REF", "0.5"))  # m
+    ice_frac = 1.0 - np.exp(-np.maximum(gcm.h_ice, 0.0) / max(1e-6, H_ice_ref))
+    # Render as "ice" only when optical coverage exceeds a small threshold
+    ice_frac_thresh = float(os.getenv("QD_TRUECOLOR_ICE_FRAC", "0.15"))
+    sea_ice_mask = (land_mask == 0) & (ice_frac >= ice_frac_thresh)
+    rgb_map[sea_ice_mask] = ice_color
+
+    # Optional land snow rendering（默认关闭；如需可由环境变量开启）
+    if int(os.getenv("QD_TRUECOLOR_SNOW_BY_TS", "0")) == 1:
+        snow_thresh = float(os.getenv("QD_SNOW_THRESH", "273.15"))
+        land_snow_mask = (land_mask == 1) & (gcm.T_s <= snow_thresh)
+        # 轻微偏白，避免与云混淆
+        rgb_map[land_snow_mask] = 0.97 * ice_color
+
+    # Cloud overlay (semi-transparent white)
+    cloud_alpha = float(os.getenv("QD_TRUECOLOR_CLOUD_ALPHA", "0.60"))  # 0..1
+    cloud_white = float(os.getenv("QD_TRUECOLOR_CLOUD_WHITE", "0.95"))  # 0..1
     cloud_layer = np.stack([gcm.cloud_cover, gcm.cloud_cover, gcm.cloud_cover], axis=-1)
-    rgb_map = rgb_map * (1 - cloud_layer) + cloud_layer * 0.9 # 0.9 makes clouds slightly off-white
-    
-    # Clamp values to be safe
-    rgb_map = np.clip(rgb_map, 0, 1)
-    
+    rgb_map = rgb_map * (1.0 - cloud_alpha * cloud_layer) + (cloud_alpha * cloud_layer) * cloud_white
+
+    # Clamp
+    rgb_map = np.clip(rgb_map, 0.0, 1.0)
+
     # Plotting
     fig, ax = plt.subplots(1, 1, figsize=(12, 6), constrained_layout=True)
     ax.imshow(rgb_map, extent=[0, 360, -90, 90], origin='lower')
     ax.set_title(f"Qingdai 'True Color' at Day {t_days:.2f}")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    
-    # Save the figure
+
+    # Save
     filename = os.path.join(output_dir, f"true_color_day_{t_days:05.1f}.png")
     plt.savefig(filename)
     plt.close(fig)
+
+    # Console diagnostics for consistency with SeaIce logs
+    try:
+        w = np.maximum(np.cos(np.deg2rad(grid.lat_mesh)), 0.0)
+        sea_ice_area = float((w * sea_ice_mask).sum() / (w.sum() + 1e-15))
+        mean_h_ice = float(gcm.h_ice[sea_ice_mask].mean()) if np.any(sea_ice_mask) else 0.0
+        print(f"[TrueColor] sea_ice_area≈{sea_ice_area:.3f}, mean_h_ice={mean_h_ice:.3f} m (thr={ice_frac_thresh}, alpha={cloud_alpha})")
+    except Exception:
+        pass
+
+def plot_ocean(grid, ocean, land_mask, t_days, output_dir):
+    """
+    Plot ocean diagnostics:
+    - SST (°C)
+    - Ocean surface currents (quiver, sub-sampled)
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6), constrained_layout=True)
+
+    # 1) SST (°C)
+    sst_c = np.nan_to_num(ocean.Ts - 273.15)
+    sst_plot = ax1.contourf(grid.lon, grid.lat, sst_c, levels=20, cmap="coolwarm")
+    ax1.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax1.set_title(f"SST (°C) at Day {t_days:.2f}")
+    ax1.set_xlabel("Longitude")
+    ax1.set_ylabel("Latitude")
+    ax1.set_xlim(0, 360)
+    ax1.set_ylim(-90, 90)
+    fig.colorbar(sst_plot, ax=ax1, label="°C")
+
+    # 2) Ocean currents (quiver, sub-sampled)
+    # Sub-sample for readability
+    step_lat = max(1, grid.n_lat // 30)
+    step_lon = max(1, grid.n_lon // 30)
+    lon_q = grid.lon_mesh[::step_lat, ::step_lon]
+    lat_q = grid.lat_mesh[::step_lat, ::step_lon]
+    uo_q = np.nan_to_num(ocean.uo[::step_lat, ::step_lon])
+    vo_q = np.nan_to_num(ocean.vo[::step_lat, ::step_lon])
+
+    speed = np.sqrt(ocean.uo**2 + ocean.vo**2)
+    sp_plot = ax2.contourf(grid.lon, grid.lat, speed, levels=20, cmap="viridis")
+    ax2.quiver(lon_q, lat_q, uo_q, vo_q, color="white", scale=400, width=0.002)
+    ax2.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax2.set_title(f"Ocean Currents (m/s) at Day {t_days:.2f}")
+    ax2.set_xlabel("Longitude")
+    ax2.set_ylabel("Latitude")
+    ax2.set_xlim(0, 360)
+    ax2.set_ylim(-90, 90)
+    fig.colorbar(sp_plot, ax=ax2, label="m/s")
+
+    # Save figure
+    fname = os.path.join(output_dir, f"ocean_day_{t_days:05.1f}.png")
+    plt.savefig(fname)
+    plt.close(fig)
+
 
 def plot_isr_components(grid, gcm, t_days, output_dir):
     """
@@ -268,6 +377,21 @@ def main():
         grid, friction_map, H=8000, tau_rad=10 * 24 * 3600, greenhouse_factor=0.3,
         C_s_map=C_s_map, land_mask=land_mask, Cs_ocean=Cs_ocean, Cs_land=Cs_land, Cs_ice=Cs_ice
     )
+
+    # --- Ocean model (P011): optional dynamic slab ocean (M1+M2+M3) ---
+    USE_OCEAN = int(os.getenv("QD_USE_OCEAN", "0")) == 1
+    ocean = None
+    if USE_OCEAN:
+        try:
+            H_ocean = float(os.getenv("QD_OCEAN_H_M", str(H_mld)))
+        except Exception:
+            H_ocean = H_mld
+        # Initialize ocean SST from current surface temperature over ocean; fill land with 288 K placeholder
+        init_Ts = np.where(land_mask == 0, gcm.T_s, 288.0)
+        ocean = WindDrivenSlabOcean(grid, land_mask, H_ocean, init_Ts=init_Ts)
+        print(f"[Ocean] Dynamic slab ocean enabled: H={H_ocean:.1f} m, CD={float(os.getenv('QD_CD', '1.5e-3'))}, R_bot={float(os.getenv('QD_R_BOT', '1.0e-6'))}")
+    else:
+        print("[Ocean] Dynamic slab ocean disabled (QD_USE_OCEAN=0).")
 
     # --- Hydrology (P009): reservoirs and parameters ---
     hydro_params = get_hydrology_params_from_env()
@@ -406,6 +530,67 @@ def main():
         # 3. Dynamics Step
         gcm.time_step(Teq, dt, albedo=albedo)
 
+        # 3a. Ocean step (P011): wind-driven currents + SST advection + optional Q_net coupling
+        if ocean is not None:
+            try:
+                # Prepare inputs
+                # Sea-ice mask: treat any positive thickness as ice-covered
+                ice_mask = (getattr(gcm, "h_ice", np.zeros_like(gcm.T_s)) > 0.0)
+                # Cloud optical field for radiation consistency if available
+                cloud_eff = getattr(gcm, "cloud_eff_last", gcm.cloud_cover)
+                # Energy params for radiation calculation
+                eparams = energy.get_energy_params_from_env()
+                # Shortwave components at surface (use same albedo as current step)
+                SW_atm, SW_sfc, _R = energy.shortwave_radiation(gcm.isr, albedo, cloud_eff, eparams)
+                # Atmospheric temperature proxy (consistent with dynamics core simplification)
+                g_const = 9.81
+                T_a = 288.0 + (g_const / 1004.0) * gcm.h
+                # Longwave at surface
+                use_lw_v2 = int(os.getenv("QD_LW_V2", "1")) == 1
+                H_ice_ref = float(os.getenv("QD_HICE_REF", "0.5"))
+                ice_frac = 1.0 - np.exp(-np.maximum(getattr(gcm, "h_ice", np.zeros_like(gcm.T_s)), 0.0) / max(1e-6, H_ice_ref))
+                if use_lw_v2:
+                    eps_sfc_map = energy.surface_emissivity_map(land_mask, ice_frac)
+                    _LW_atm, LW_sfc, _OLR, _DLR, _eps = energy.longwave_radiation_v2(
+                        gcm.T_s, T_a, cloud_eff, eps_sfc_map, eparams
+                    )
+                else:
+                    _LW_atm, LW_sfc, _OLR, _DLR, _eps = energy.longwave_radiation(
+                        gcm.T_s, T_a, cloud_eff, eparams
+                    )
+                # Sensible heat flux (SH)
+                C_H = float(os.getenv("QD_CH", "1.5e-3"))
+                cp_air = float(os.getenv("QD_CP_A", "1004.0"))
+                rho_air = float(getattr(getattr(gcm, "hum_params", None), "rho_a", 1.2))
+                B_land = float(os.getenv("QD_BOWEN_LAND", "0.7"))
+                B_ocean = float(os.getenv("QD_BOWEN_OCEAN", "0.3"))
+                SH_arr, _LH_bowen = energy.boundary_layer_fluxes(
+                    gcm.T_s, T_a, gcm.u, gcm.v, land_mask,
+                    C_H=C_H, rho=rho_air, c_p=cp_air, B_land=B_land, B_ocean=B_ocean
+                )
+                # Latent heat (LH) from humidity module diagnostics (already computed in dynamics)
+                LH_arr = getattr(gcm, "LH_last", 0.0)
+                if np.isscalar(LH_arr):
+                    LH_arr = np.full_like(gcm.T_s, float(LH_arr))
+                # Net heat into surface (W/m^2)
+                Q_net = SW_sfc - LW_sfc - SH_arr - LH_arr
+
+                # Advance ocean
+                ocean.step(dt, gcm.u, gcm.v, Q_net=Q_net, ice_mask=ice_mask)
+
+                # Inject SST back into atmospheric surface temperature over open ocean (no ice)
+                ocean_open = (land_mask == 0) & (~ice_mask)
+                gcm.T_s = np.where(ocean_open, ocean.Ts, gcm.T_s)
+
+                # Optional diagnostics
+                if int(os.getenv("QD_OCEAN_DIAG", "1")) == 1 and (i % 200 == 0):
+                    od = ocean.diagnostics()
+                    print(f"[OceanDiag] KE_mean={od['KE_mean']:.3e} m2/s2 | Umax={od['U_max']:.2f} m/s | "
+                          f"eta[{od['eta_min']:.3f},{od['eta_max']:.3f}] m | cfl/sqrt(gH)/dx={od['cfl_per_s']:.3e} s^-1")
+            except Exception as e:
+                if i == 0:
+                    print(f"[Ocean] step skipped due to error: {e}")
+
         # 3b. Humidity diagnostics (P008): global means of E, P_cond, LH, LH_release
         try:
             if getattr(gcm, "hum_params", None) is not None and getattr(gcm.hum_params, "diag", False):
@@ -506,8 +691,15 @@ def main():
                 )
         
         if i % plot_interval_steps == 0:
-            plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir)
+            plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean)
             plot_true_color(grid, gcm, land_mask, t_days, output_dir)
+            # Ocean SST & currents
+            if ocean is not None:
+                try:
+                    plot_ocean(grid, ocean, land_mask, t_days, output_dir)
+                except Exception as _e:
+                    if i == 0:
+                        print(f"[PlotOcean] skipped due to error: {_e}")
             # Diagnostics: per-star ISR components (disabled by default; enable with QD_PLOT_ISR=1)
             if PLOT_ISR:
                 plot_isr_components(grid, gcm, t_days, output_dir)

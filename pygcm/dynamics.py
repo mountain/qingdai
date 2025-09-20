@@ -7,7 +7,7 @@ This approach avoids the grid-point instabilities faced by finite-difference met
 
 import os
 import numpy as np
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, convolve
 from .grid import SphericalGrid
 from . import constants as const
 from . import energy as energy
@@ -137,6 +137,98 @@ class SpectralModel:
         # Inverse Fourier transform
         return np.fft.irfft(grid_data_fft, n=self.grid.n_lon, axis=1)
 
+    # ---------------- Project 010: Hyperdiffusion utilities ----------------
+    def _laplacian_sphere(self, F: np.ndarray) -> np.ndarray:
+        """
+        Spherical Laplacian of a scalar field F on a regular lat-lon grid.
+        Uses divergence form with cos(phi) weighting for numerical robustness.
+        Longitude is treated as periodic; latitude uses np.gradient one-sided at poles.
+        """
+        a = self.a
+        dphi = self.dlat_rad
+        dlmb = self.dlon_rad
+        phi = np.deg2rad(self.grid.lat_mesh)
+        # Cap cos at 0.2 to avoid polar metric blow-up; pragmatic stabilizer on regular lat-lon grids
+        cos = np.maximum(np.cos(phi), 0.2)
+        # Sanitize input to avoid NaN/Inf amplification in derivatives
+        F = np.nan_to_num(F, copy=False)
+
+        # Latitude part: (1/cos) * d/dphi ( cos * dF/dphi )
+        dF_dphi = np.gradient(F, dphi, axis=0)
+        term_phi = (1.0 / cos) * np.gradient(cos * dF_dphi, dphi, axis=0)
+
+        # Longitude part: (1/cos^2) * d2F/dlambda2 with periodic BC
+        d2F_dlmb2 = (np.roll(F, -1, axis=1) - 2.0 * F + np.roll(F, 1, axis=1)) / (dlmb ** 2)
+        term_lmb = d2F_dlmb2 / (cos ** 2)
+
+        return (term_phi + term_lmb) / (a ** 2)
+
+    def _hyperdiffuse(self, F: np.ndarray, k4: float, dt: float, n_substeps: int = 1) -> np.ndarray:
+        """
+        Apply explicit 4th-order hyperdiffusion: dF/dt = -k4 * ∇⁴ F
+        Implemented as two successive Laplacians. Optionally uses substeps for stability margin.
+        """
+        try:
+            k4 = float(k4)
+        except Exception:
+            return F
+        if k4 <= 0.0 or dt <= 0.0:
+            return F
+        n = max(1, int(n_substeps))
+        sub_dt = dt / n
+        out = F
+        for _ in range(n):
+            L = self._laplacian_sphere(out)
+            L2 = self._laplacian_sphere(L)
+            out = out - k4 * L2 * sub_dt
+        return out
+
+    # ---------------- Project 010 M4: Alternate filters (Shapiro / Spectral) ----------------
+    def _shapiro_filter(self, F: np.ndarray, n: int = 2, lon_wrap: bool = True) -> np.ndarray:
+        """
+        Shapiro-like smoothing via separable 1-2-1 kernel repeated n times.
+        - Longitude uses periodic wrap.
+        - Latitude uses nearest-edge (no wrap across poles).
+        """
+        try:
+            n = max(1, int(n))
+        except Exception:
+            n = 2
+        k1 = np.array([1.0, 2.0, 1.0], dtype=float)
+        k1 /= k1.sum()  # [0.25, 0.5, 0.25]
+        out = np.nan_to_num(F, copy=True)
+        for _ in range(n):
+            out = convolve(out, k1[np.newaxis, :], mode="wrap" if lon_wrap else "nearest")
+            out = convolve(out, k1[:, np.newaxis], mode="nearest")
+        return out
+
+    def _spectral_zonal_filter(self, F: np.ndarray, cutoff: float = 0.75, damp: float = 0.5) -> np.ndarray:
+        """
+        Zonal-FFT high-wavenumber damping.
+        - cutoff: fraction of Nyquist (0..1). k > cutoff*k_N are damped.
+        - damp:   damping strength (0..1), where 1 means zero out high-k.
+        """
+        try:
+            cutoff = float(cutoff)
+            damp = float(damp)
+        except Exception:
+            return F
+        if damp <= 0.0 or cutoff <= 0.0:
+            return np.nan_to_num(F, copy=False)
+
+        arr = np.nan_to_num(F, copy=False)
+        fft = np.fft.rfft(arr, axis=1)
+        bins = fft.shape[1]
+        if bins <= 1:
+            return arr
+        kN = bins - 1
+        kcut = int(max(1, min(kN, int(cutoff * kN))))
+        factor = np.ones(bins, dtype=float)
+        factor[kcut:] *= max(0.0, 1.0 - min(1.0, damp))
+        fft *= factor[np.newaxis, :]
+        out = np.fft.irfft(fft, n=self.grid.n_lon, axis=1)
+        return np.nan_to_num(out, copy=False)
+
     def time_step(self, Teq_field, dt, albedo=None):
         """
         Advances the model state by one time step in spectral space.
@@ -233,7 +325,25 @@ class SpectralModel:
                 self.cloud_eff_last = cloud_eff
 
                 SW_atm, SW_sfc, R = energy.shortwave_radiation(self.isr, albedo, cloud_eff, self.energy_params)
-                LW_atm, LW_sfc, OLR, DLR, eps = energy.longwave_radiation(self.T_s, T_a, cloud_eff, self.energy_params)
+                # P006 upgrade (optional): cloud-optical-aware LW + surface emissivity map
+                use_lw_v2 = int(os.getenv("QD_LW_V2", "1")) == 1
+                if use_lw_v2:
+                    # Sea-ice optical fraction for emissivity blending (ocean→ice)
+                    H_ice_ref = float(os.getenv("QD_HICE_REF", "0.5"))
+                    if hasattr(self, "h_ice"):
+                        ice_frac = 1.0 - np.exp(-np.maximum(self.h_ice, 0.0) / max(1e-6, H_ice_ref))
+                    else:
+                        ice_frac = np.zeros_like(self.T_s)
+                    # Surface emissivity map (ocean/land/ice)
+                    if getattr(self, "land_mask", None) is not None:
+                        eps_sfc_map = energy.surface_emissivity_map(self.land_mask, ice_frac)
+                    else:
+                        eps_sfc_map = float(os.getenv("QD_EPS_DEFAULT", "0.97"))
+                    LW_atm, LW_sfc, OLR, DLR, eps = energy.longwave_radiation_v2(
+                        self.T_s, T_a, cloud_eff, eps_sfc_map, self.energy_params
+                    )
+                else:
+                    LW_atm, LW_sfc, OLR, DLR, eps = energy.longwave_radiation(self.T_s, T_a, cloud_eff, self.energy_params)
                 # M2: Sensible heat flux (SH) via bulk formula; use humidity rho_a and env overrides
                 try:
                     C_H = float(os.getenv("QD_CH", "1.5e-3"))
@@ -383,7 +493,111 @@ class SpectralModel:
         friction_drag_v = -self.friction_map * self.v
         self.u += friction_drag_u * dt
         self.v += friction_drag_v * dt
-        
+
+        # ---------------- Project 010: Scale-selective dissipation (hyperdiffusion) ----------------
+        try:
+            diff_enabled = int(os.getenv("QD_DIFF_ENABLE", "1")) == 1
+            filter_type = os.getenv("QD_FILTER_TYPE", "combo").lower()
+            diff_every = int(os.getenv("QD_DIFF_EVERY", "1"))
+        except Exception:
+            diff_enabled = True
+            filter_type = "hyper4"
+            diff_every = 1
+
+        if diff_enabled and (filter_type in ("hyper4", "combo")) and (self._step_counter % max(1, diff_every) == 0):
+            dyn_diag = int(os.getenv("QD_DYN_DIAG", "0")) == 1
+            if dyn_diag and (self._step_counter % 200 == 0):
+                var_u0 = float(np.var(self.u))
+                var_v0 = float(np.var(self.v))
+                var_h0 = float(np.var(self.h))
+
+            sigma4_env = os.getenv("QD_SIGMA4", "0.02")
+            dx_min = None
+            sigma4 = None
+            if sigma4_env is not None:
+                try:
+                    sigma4 = float(sigma4_env)
+                except Exception:
+                    sigma4 = 0.02
+                # Metric lengths (most conservative)
+                dx_lat = self.a * self.dlat_rad
+                min_cos = float(max(1e-3, np.cos(np.deg2rad(self.grid.lat)).min()))
+                dx_lon_min = self.a * self.dlon_rad * min_cos
+                dx_min = min(dx_lat, dx_lon_min)
+                k4_base = sigma4 * (dx_min ** 4) / max(1e-12, dt)
+                k4_u = float(os.getenv("QD_K4_U", k4_base))
+                k4_v = float(os.getenv("QD_K4_V", k4_base))
+                k4_h = float(os.getenv("QD_K4_H", 0.5 * k4_base))
+                k4_q = float(os.getenv("QD_K4_Q", 0.5 * k4_base))
+                k4_c = float(os.getenv("QD_K4_CLOUD", 0.25 * k4_base))
+            else:
+                k4_u = float(os.getenv("QD_K4_U", "1.0e14"))
+                k4_v = float(os.getenv("QD_K4_V", "1.0e14"))
+                k4_h = float(os.getenv("QD_K4_H", "5.0e13"))
+                k4_q = float(os.getenv("QD_K4_Q", "0.0"))
+                k4_c = float(os.getenv("QD_K4_CLOUD", "0.0"))
+
+            # Apply hyperdiffusion to dynamical fields
+            try:
+                nsub = int(os.getenv("QD_K4_NSUB", "1"))
+            except Exception:
+                nsub = 1
+            self.u = self._hyperdiffuse(self.u, k4_u, dt, n_substeps=nsub)
+            self.v = self._hyperdiffuse(self.v, k4_v, dt, n_substeps=nsub)
+            self.h = self._hyperdiffuse(self.h, k4_h, dt, n_substeps=nsub)
+            # Optional: humidity and cloud fields (weaker, off by default)
+            apply_q = (k4_q > 0.0) or (int(os.getenv("QD_DIFF_Q", "0")) == 1)
+            apply_cloud = (k4_c > 0.0) or (int(os.getenv("QD_DIFF_CLOUD", "0")) == 1)
+            if apply_q and hasattr(self, "q"):
+                self.q = self._hyperdiffuse(self.q, k4_q, dt)
+            if apply_cloud:
+                self.cloud_cover = self._hyperdiffuse(self.cloud_cover, k4_c, dt)
+
+            if dyn_diag and (self._step_counter % 200 == 0):
+                var_u1 = float(np.var(self.u))
+                var_v1 = float(np.var(self.v))
+                var_h1 = float(np.var(self.h))
+                msg = "[DynDiag] hyper4 applied: "
+                if sigma4 is not None:
+                    msg += f"sigma4={sigma4:.4f}, "
+                if dx_min is not None:
+                    msg += f"dx_min={dx_min:.1f} m, "
+                msg += f"K4(u/v/h)={[k4_u, k4_v, k4_h]} "
+                msg += f"Var(u) {var_u0:.3e}->{var_u1:.3e}, Var(v) {var_v0:.3e}->{var_v1:.3e}, Var(h) {var_h0:.3e}->{var_h1:.3e}"
+                print(msg)
+
+        # ---------------- Project 010 M4: Apply alternate filters by config ----------------
+        try:
+            ftype = os.getenv("QD_FILTER_TYPE", "combo").lower()
+            # Shapiro smoothing
+            sh_every = int(os.getenv("QD_SHAPIRO_EVERY", "6"))
+            sh_n = int(os.getenv("QD_SHAPIRO_N", "2"))
+            need_shapiro = (
+                (ftype in ("shapiro", "combo") and sh_every > 0 and (self._step_counter % sh_every == 0))
+                or (ftype == "hyper4" and sh_every > 0 and (self._step_counter % sh_every == 0))
+            )
+            if need_shapiro:
+                self.u = self._shapiro_filter(self.u, n=sh_n, lon_wrap=True)
+                self.v = self._shapiro_filter(self.v, n=sh_n, lon_wrap=True)
+                self.h = self._shapiro_filter(self.h, n=sh_n, lon_wrap=True)
+                if int(os.getenv("QD_DIFF_Q", "0")) == 1 and hasattr(self, "q"):
+                    self.q = self._shapiro_filter(self.q, n=max(1, sh_n - 1), lon_wrap=True)
+                if int(os.getenv("QD_DIFF_CLOUD", "0")) == 1:
+                    self.cloud_cover = self._shapiro_filter(self.cloud_cover, n=max(1, sh_n - 1), lon_wrap=True)
+
+            # Spectral zonal damping (optional or part of combo)
+            spec_every = int(os.getenv("QD_SPEC_EVERY", "0"))
+            spec_cut = float(os.getenv("QD_SPEC_CUTOFF", "0.75"))
+            spec_damp = float(os.getenv("QD_SPEC_DAMP", "0.5"))
+            # Spectral damping disabled when spec_every <= 0
+            need_spec = (ftype in ("spectral", "combo")) and (spec_every > 0) and (self._step_counter % spec_every == 0)
+            if need_spec:
+                self.u = self._spectral_zonal_filter(self.u, cutoff=spec_cut, damp=spec_damp)
+                self.v = self._spectral_zonal_filter(self.v, cutoff=spec_cut, damp=spec_damp)
+                self.h = self._spectral_zonal_filter(self.h, cutoff=spec_cut, damp=spec_damp)
+        except Exception:
+            pass
+
         # Advect cloud cover
         self.cloud_cover = self._advect(self.cloud_cover, dt)
 
@@ -392,7 +606,10 @@ class SpectralModel:
         self.cloud_cover *= (1 - cloud_dissipation_rate)
         
         # Apply mild diffusion to all fields to ensure stability without over-damping
-        diffusion_factor = 0.995
+        try:
+            diffusion_factor = float(os.getenv("QD_DIFF_FACTOR", "0.998"))
+        except Exception:
+            diffusion_factor = 0.998
         self.u *= diffusion_factor
         self.v *= diffusion_factor
         self.h *= diffusion_factor

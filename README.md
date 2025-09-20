@@ -60,6 +60,8 @@
     - 能量框架（P006）：`QD_ENERGY_W`（0..1，能量收支权重）、`QD_ENERGY_DIAG`（能量诊断）、`QD_T_FLOOR`（夜侧温度下限）
     - 湿度–云一致性（P008 M4）：`QD_CLOUD_COUPLE`（启用耦合）、`QD_RH0`、`QD_K_Q`、`QD_K_P`、`QD_PCOND_REF`
     - 水文闭合与径流（P009）：`QD_WATER_DIAG`（水量诊断）、`QD_RUNOFF_TAU_DAYS`（径流时标/天）、`QD_WLAND_CAP`（陆地水库容量/毫米，可选）、`QD_SNOW_THRESH`（雨雪阈值/K）、`QD_SNOW_MELT_RATE`（融雪速率/毫米·天⁻¹）
+    - 动力学反噪（P010）：`QD_FILTER_TYPE`（`hyper4|shapiro|spectral|combo`，默认 `combo`）、`QD_SIGMA4`（∇⁴ 自适应强度，默认 0.02）、`QD_DIFF_EVERY`（施加频率，默认 1）、`QD_K4_NSUB`（超扩散子步，默认 1）、`QD_SHAPIRO_N`（默认 2）、`QD_SHAPIRO_EVERY`（默认 6）、`QD_SPEC_EVERY`（谱带阻频率，默认 0=关闭）、`QD_SPEC_CUTOFF`（默认 0.75）、`QD_SPEC_DAMP`（默认 0.5）、`QD_DIFF_FACTOR`（温和全局扩散，默认 0.998）
+    - True Color 可视化：`QD_TRUECOLOR_ICE_FRAC`（冰显示阈值，默认 0.15）、`QD_TRUECOLOR_CLOUD_ALPHA`（云不透明度，默认 0.60）、`QD_TRUECOLOR_CLOUD_WHITE`（云白度，默认 0.95）、`QD_TRUECOLOR_SNOW_BY_TS`（是否按温度渲染陆地积雪，默认 0）
     - 说明：脚本启动时会打印地形来源、海陆比例、反照率/摩擦统计等日志，便于检查。
 
 
@@ -73,6 +75,7 @@
 7.  **平板海洋与海冰（P007）**: [projects/007-slab-ocean.md](./projects/007-slab-ocean.md)
 8.  **大气湿度与E–P–LH闭环（P008）**: [projects/008-humidity.md](./projects/008-humidity.md)
 9.  **行星水循环闭合（P009）**: [projects/009-planetary-hydrology.md](./projects/009-planetary-hydrology.md)
+10. **更好的动力学/反噪（P010）**: [projects/010-better-dynamics.md](./projects/010-better-dynamics.md)
 
 ## 🤝 贡献
 
