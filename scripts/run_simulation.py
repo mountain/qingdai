@@ -18,8 +18,9 @@ from pygcm.grid import SphericalGrid
 from pygcm.orbital import OrbitalSystem
 from pygcm.forcing import ThermalForcing
 from pygcm.dynamics import SpectralModel
-from pygcm.topography import create_land_sea_mask, generate_base_properties
-from pygcm.physics import diagnose_precipitation, parameterize_cloud_cover, calculate_dynamic_albedo, cloud_from_precip
+from pygcm.topography import create_land_sea_mask, generate_base_properties, load_topography_from_netcdf
+from pygcm.physics import diagnose_precipitation, parameterize_cloud_cover, calculate_dynamic_albedo, cloud_from_precip, compute_orographic_factor
+from pygcm.hydrology import get_hydrology_params_from_env, partition_precip_phase, snow_step, update_land_bucket, diagnose_water_closure
 
 def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output_dir):
     """
@@ -214,7 +215,47 @@ def main():
     grid = SphericalGrid(n_lat=121, n_lon=240)
 
     print("Creating topography...")
-    land_mask = create_land_sea_mask(grid)
+    topo_nc = os.getenv("QD_TOPO_NC")
+    elevation = None
+    if topo_nc and os.path.exists(topo_nc):
+        try:
+            elevation, land_mask, base_albedo_map, friction_map = load_topography_from_netcdf(topo_nc, grid)
+        except Exception as e:
+            print(f"[Topo] Failed to load '{topo_nc}': {e}\nFalling back to procedural generation.")
+            land_mask = create_land_sea_mask(grid)
+            base_albedo_map, friction_map = generate_base_properties(land_mask)
+            elevation = None
+        else:
+            # Loader already prints stats
+            pass
+    else:
+        land_mask = create_land_sea_mask(grid)
+        base_albedo_map, friction_map = generate_base_properties(land_mask)
+        # Log fallback stats
+        LAT = grid.lat_mesh
+        area_w = np.cos(np.deg2rad(LAT))
+        achieved = float((area_w * (land_mask == 1)).sum() / (area_w.sum() + 1e-15))
+        print(f"[Topo] Procedural topography (no external NetCDF). Land fraction: {achieved:.3f}")
+        print(f"[Topo] Albedo stats (min/mean/max): {np.min(base_albedo_map):.3f}/{np.mean(base_albedo_map):.3f}/{np.max(base_albedo_map):.3f}")
+        print(f"[Topo] Friction stats (min/mean/max): {np.min(friction_map):.2e}/{np.mean(friction_map):.2e}/{np.max(friction_map):.2e}")
+
+    # --- Slab Ocean (P007 M1): construct per-grid surface heat capacity map ---
+    # C_s_ocean = rho_w * c_p_w * H_mld; land uses smaller constant C_s_land
+    rho_w = float(os.getenv("QD_RHO_W", "1000"))      # kg/m^3
+    cp_w = float(os.getenv("QD_CP_W", "4200"))        # J/(kg K)
+    H_mld = float(os.getenv("QD_MLD_M", "50"))        # m
+    Cs_ocean = rho_w * cp_w * H_mld                   # J/m^2/K
+    Cs_land = float(os.getenv("QD_CS_LAND", "3e6"))   # J/m^2/K
+    Cs_ice = float(os.getenv("QD_CS_ICE", "5e6"))     # J/m^2/K (thin ice/snow effective capacity)
+    C_s_map = np.where(land_mask == 1, Cs_land, Cs_ocean).astype(float)
+
+    # Diagnostics
+    LAT = grid.lat_mesh
+    area_w = np.cos(np.deg2rad(LAT))
+    area_w = np.maximum(area_w, 0.0)
+    land_area = float((area_w * (land_mask == 1)).sum() / (area_w.sum() + 1e-15))
+    print(f"[SlabOcean] H_mld={H_mld:.1f} m -> C_s_ocean={Cs_ocean:.2e} J/m^2/K, C_s_land={Cs_land:.2e}")
+    print(f"[SlabOcean] Land fraction={land_area:.3f}; C_s stats (min/mean/max): {np.min(C_s_map):.2e}/{np.mean(C_s_map):.2e}/{np.max(C_s_map):.2e}")
 
     print("Initializing orbital mechanics...")
     orbital_sys = OrbitalSystem()
@@ -223,8 +264,17 @@ def main():
     forcing = ThermalForcing(grid, orbital_sys)
 
     print("Initializing dynamics core with surface friction and greenhouse effect...")
-    base_albedo_map, friction_map = generate_base_properties(land_mask)
-    gcm = SpectralModel(grid, friction_map, H=8000, tau_rad=10 * 24 * 3600, greenhouse_factor=0.3)
+    gcm = SpectralModel(
+        grid, friction_map, H=8000, tau_rad=10 * 24 * 3600, greenhouse_factor=0.3,
+        C_s_map=C_s_map, land_mask=land_mask, Cs_ocean=Cs_ocean, Cs_land=Cs_land, Cs_ice=Cs_ice
+    )
+
+    # --- Hydrology (P009): reservoirs and parameters ---
+    hydro_params = get_hydrology_params_from_env()
+    W_land = np.zeros_like(grid.lat_mesh, dtype=float)   # land bucket water (kg m^-2)
+    S_snow = np.zeros_like(grid.lat_mesh, dtype=float)   # land snow water-equivalent (kg m^-2)
+    _hydro_prev_total = None
+    _hydro_prev_time = None
 
     # --- Simulation Parameters ---
     dt = int(os.getenv("QD_DT_SECONDS", "300"))  # default 300s
@@ -238,9 +288,15 @@ def main():
     print("Setting physics parameters...")
     D_crit = -1e-7  # Critical convergence for precipitation (s^-1).
     k_precip = 1e5    # Precipitation efficiency.
-    alpha_water = 0.1   # Albedo of water/land
+    alpha_water = 0.1   # Albedo of water/land (fallback when not using base map)
     alpha_ice = 0.6     # Albedo of ice
     alpha_cloud = 0.5   # Average cloud albedo
+    # Topography-driven options
+    USE_TOPO_ALBEDO = int(os.getenv("QD_USE_TOPO_ALBEDO", "1")) == 1
+    OROG_ENABLED = int(os.getenv("QD_OROG", "0")) == 1
+    K_OROG = float(os.getenv("QD_OROG_K", "7e-4"))
+    # Diagnostics toggle: per-star ISR components (disabled by default)
+    PLOT_ISR = int(os.getenv("QD_PLOT_ISR", "0")) == 1
     
     time_steps = np.arange(0, sim_duration_seconds, dt)
 
@@ -272,6 +328,14 @@ def main():
         # 1. Physics Step
         # 1) Diagnose precipitation from dynamics WITHOUT cloud gating (avoid circularity)
         precip = diagnose_precipitation(gcm, grid, D_crit, k_precip, cloud_threshold=None)
+        # Optional orographic enhancement (uses upslope wind and elevation)
+        if OROG_ENABLED and (elevation is not None):
+            try:
+                factor = compute_orographic_factor(grid, elevation, gcm.u, gcm.v, k_orog=K_OROG)
+                precip = precip * factor
+            except Exception as e:
+                if i == 0:
+                    print(f"[Orog] Disabled due to error: {e}")
         
         # 1b) Convert precipitation to cloud fraction via smooth saturating relation
         if np.any(precip > 0):
@@ -317,7 +381,20 @@ def main():
         gcm.cloud_cover = np.clip(gcm.cloud_cover, 0.0, 1.0)
 
         # 2) Radiative albedo using updated cloud cover
-        albedo = calculate_dynamic_albedo(gcm.cloud_cover, gcm.T_s, alpha_water, alpha_ice, alpha_cloud)
+        #    Use sea-ice fraction derived from thickness (saturating), consistent with M2 thermodynamics.
+        H_ice_ref = float(os.getenv("QD_HICE_REF", "0.5"))  # m, e-folding thickness for ice optical effect
+        ice_frac = 1.0 - np.exp(-np.maximum(gcm.h_ice, 0.0) / max(1e-6, H_ice_ref))
+        # M4: Use humidity/precipitation-coupled cloud for radiation/albedo if available
+        cloud_for_rad = getattr(gcm, "cloud_eff_last", gcm.cloud_cover)
+
+        if USE_TOPO_ALBEDO:
+            albedo = calculate_dynamic_albedo(
+                cloud_for_rad, gcm.T_s, base_albedo_map, alpha_ice, alpha_cloud, land_mask=land_mask, ice_frac=ice_frac
+            )
+        else:
+            albedo = calculate_dynamic_albedo(
+                cloud_for_rad, gcm.T_s, alpha_water, alpha_ice, alpha_cloud, land_mask=land_mask, ice_frac=ice_frac
+            )
 
         # 2. Forcing Step
         # Compute two-star insolation components and diagnostics
@@ -327,7 +404,96 @@ def main():
         Teq = forcing.calculate_equilibrium_temp(t, albedo)
 
         # 3. Dynamics Step
-        gcm.time_step(Teq, dt)
+        gcm.time_step(Teq, dt, albedo=albedo)
+
+        # 3b. Humidity diagnostics (P008): global means of E, P_cond, LH, LH_release
+        try:
+            if getattr(gcm, "hum_params", None) is not None and getattr(gcm.hum_params, "diag", False):
+                if i % 200 == 0:
+                    w = np.maximum(np.cos(np.deg2rad(grid.lat_mesh)), 0.0)
+                    wsum = np.sum(w) + 1e-15
+                    def wmean(x):
+                        return float(np.sum(x * w) / wsum)
+                    E_mean = wmean(getattr(gcm, "E_flux_last", 0.0))
+                    Pcond_mean = wmean(getattr(gcm, "P_cond_flux_last", 0.0))
+                    LH_mean = wmean(getattr(gcm, "LH_last", 0.0))
+                    LHrel_mean = wmean(getattr(gcm, "LH_release_last", 0.0))
+                    print(f"[HumidityDiag] ⟨E⟩={E_mean:.3e} kg/m^2/s | ⟨P_cond⟩={Pcond_mean:.3e} kg/m^2/s | "
+                          f"⟨LH⟩={LH_mean:.2f} W/m^2 | ⟨LH_release⟩={LHrel_mean:.2f} W/m^2")
+        except Exception:
+            pass
+
+        # 3c. Hydrology step (P009): E–P–R, snow and water-closure diagnostics
+        try:
+            # Fluxes from humidity module (kg m^-2 s^-1)
+            E_flux = getattr(gcm, "E_flux_last", 0.0)
+            P_flux = getattr(gcm, "P_cond_flux_last", 0.0)
+
+            # Ensure array shape
+            if np.isscalar(E_flux):
+                E_flux = np.full_like(gcm.T_s, float(E_flux))
+            if np.isscalar(P_flux):
+                P_flux = np.full_like(gcm.T_s, float(P_flux))
+
+            # Phase partition (rain/snow) by surface temperature
+            P_rain, P_snow = partition_precip_phase(P_flux, gcm.T_s, T_thresh=hydro_params.snow_thresh_K)
+
+            land = (land_mask == 1)
+            # Land components
+            P_rain_land = P_rain * land
+            P_snow_land = P_snow * land
+            E_land = E_flux * land
+
+            # Update land snow reservoir and compute melt flux (kg m^-2 s^-1)
+            S_snow, melt_flux_land = snow_step(S_snow, P_snow_land, gcm.T_s, hydro_params, dt)
+
+            # Land bucket update: inputs = rain + snowmelt; evaporation removes; runoff returned to ocean
+            P_in_land = P_rain_land + melt_flux_land
+            W_land, R_flux_land = update_land_bucket(W_land, P_in_land, E_land, hydro_params, dt)
+
+            # Diagnostics: global water closure (area-weighted)
+            if getattr(hydro_params, "diag", True) and (i % 200 == 0):
+                # Time since previous diagnostic
+                t_now = (i * dt)
+                dt_since_prev = None if _hydro_prev_time is None else (t_now - _hydro_prev_time)
+
+                # Required densities/heights from modules
+                rho_a = float(getattr(gcm.hum_params, "rho_a", 1.2))
+                h_mbl = float(getattr(gcm.hum_params, "h_mbl", 800.0))
+                rho_i = float(getattr(gcm, "rho_i", 917.0))
+
+                diag_h2o = diagnose_water_closure(
+                    lat_mesh=grid.lat_mesh,
+                    q=getattr(gcm, "q", np.zeros_like(gcm.T_s)),
+                    rho_a=rho_a,
+                    h_mbl=h_mbl,
+                    h_ice=getattr(gcm, "h_ice", np.zeros_like(gcm.T_s)),
+                    rho_i=rho_i,
+                    W_land=W_land,
+                    S_snow=S_snow,
+                    E_flux=E_flux,
+                    P_flux=P_flux,
+                    R_flux=R_flux_land,   # runoff only from land
+                    dt_since_prev=dt_since_prev,
+                    prev_total=_hydro_prev_total
+                )
+
+                # Print concise diagnostics
+                msg = (f"[WaterDiag] ⟨E⟩={diag_h2o['E_mean']:.3e} kg/m^2/s | "
+                       f"⟨P⟩={diag_h2o['P_mean']:.3e} | ⟨R⟩={diag_h2o['R_mean']:.3e} | "
+                       f"⟨CWV⟩={diag_h2o['CWV_mean']:.3e} kg/m^2 | ⟨ICE⟩={diag_h2o['ICE_mean']:.3e} | "
+                       f"⟨W_land⟩={diag_h2o['W_land_mean']:.3e} | ⟨S_snow⟩={diag_h2o['S_snow_mean']:.3e}")
+                if "closure_residual" in diag_h2o and "d/dt_total_mean" in diag_h2o:
+                    msg += (f" | d/dt Σ={diag_h2o['d/dt_total_mean']:.3e} vs (E−P−R) -> "
+                            f"residual={diag_h2o['closure_residual']:.3e}")
+                print(msg)
+
+                # Update prev totals/time
+                _hydro_prev_total = diag_h2o["total_reservoir_mean"]
+                _hydro_prev_time = t_now
+        except Exception as _e:
+            if i == 0:
+                print(f"[Hydrology] step skipped due to error: {_e}")
 
         # 4. (Optional) Print diagnostics and generate plots
         t_days = t / day_in_seconds
@@ -342,8 +508,9 @@ def main():
         if i % plot_interval_steps == 0:
             plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir)
             plot_true_color(grid, gcm, land_mask, t_days, output_dir)
-            # Diagnostics: save per-star ISR components to verify double centers
-            plot_isr_components(grid, gcm, t_days, output_dir)
+            # Diagnostics: per-star ISR components (disabled by default; enable with QD_PLOT_ISR=1)
+            if PLOT_ISR:
+                plot_isr_components(grid, gcm, t_days, output_dir)
 
 
     print("\n--- Simulation Finished ---")

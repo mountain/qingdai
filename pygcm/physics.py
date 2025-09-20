@@ -112,24 +112,138 @@ def parameterize_cloud_cover(gcm, grid, land_mask):
     # Clamp the final source term
     return np.clip(cloud_source, 0.0, 1.0)
 
-def calculate_dynamic_albedo(cloud_cover, T_s, alpha_water, alpha_ice, alpha_cloud):
+def compute_orographic_factor(grid, elevation, u, v, k_orog=7e-4, cap=2.0, smooth_sigma=1.0):
     """
-    Calculates the local albedo based on cloud cover and surface ice.
+    Compute multiplicative orographic precipitation enhancement factor based on upslope wind.
+      - n_hat = grad(H)/|grad(H)| (slope unit vector); if |grad(H)|~0, factor=1
+      - uplift = max(0, U · n_hat), where U=(u, v)
+      - factor = clip(1 + k_orog * uplift, 1, cap), optionally smoothed
 
     Args:
-        cloud_cover (np.ndarray): Cloud cover fraction field.
-        T_s (np.ndarray): Surface temperature field (K).
-        alpha_water (float): Albedo of water/land.
-        alpha_ice (float): Albedo of ice.
-        alpha_cloud (float): Albedo of clouds.
+        grid (SphericalGrid): Grid providing spacings (dlat_rad, dlon_rad) and lat_mesh.
+        elevation (np.ndarray): Elevation in meters (lat x lon).
+        u, v (np.ndarray): Wind components (m/s).
+        k_orog (float): Scaling coefficient for uplift strength.
+        cap (float): Upper limit for enhancement factor (>=1).
+        smooth_sigma (float): Gaussian sigma (grid points) to smooth factor.
 
     Returns:
-        np.ndarray: Dynamic albedo field.
+        np.ndarray: Orographic factor >= 1 with same shape as elevation.
     """
-    # Determine surface albedo based on temperature (ice-albedo feedback)
-    freezing_point = 273.15
-    surface_albedo = np.where(T_s < freezing_point, alpha_ice, alpha_water)
-    
-    # Combine surface albedo with cloud albedo
-    albedo = surface_albedo * (1 - cloud_cover) + alpha_cloud * cloud_cover
-    return albedo
+    a = constants.PLANET_RADIUS
+    lat_rad = np.deg2rad(grid.lat_mesh)
+    cos_lat = np.maximum(np.cos(lat_rad), 1e-6)
+
+    dx = a * cos_lat * grid.dlon_rad  # meters per lon step
+    dy = a * grid.dlat_rad            # meters per lat step
+
+    # Central differences for surface gradient (m/m)
+    dHdx = (np.roll(elevation, -1, axis=1) - np.roll(elevation, 1, axis=1)) / (2.0 * dx)
+    dHdy = (np.roll(elevation, -1, axis=0) - np.roll(elevation, 1, axis=0)) / (2.0 * dy)
+
+    # Regularize poles
+    dHdy[0, :] = 0.0
+    dHdy[-1, :] = 0.0
+
+    grad_norm = np.sqrt(dHdx**2 + dHdy**2)
+    eps = 1e-12
+    n_x = np.where(grad_norm > eps, dHdx / (grad_norm + eps), 0.0)
+    n_y = np.where(grad_norm > eps, dHdy / (grad_norm + eps), 0.0)
+
+    uplift = np.maximum(0.0, u * n_x + v * n_y)  # m/s projected upslope wind
+    factor = 1.0 + k_orog * uplift
+    factor = np.clip(factor, 1.0, cap)
+
+    if smooth_sigma and smooth_sigma > 0:
+        factor = gaussian_filter(factor, sigma=smooth_sigma)
+
+    return factor
+
+
+def calculate_dynamic_albedo(cloud_cover,
+                             T_s,
+                             base_albedo,
+                             alpha_ice,
+                             alpha_cloud,
+                             land_mask=None,
+                             t_freeze: float = 271.35,
+                             delta_T: float = 5.0,
+                             ice_only_over_ocean: bool = True,
+                             ocean_albedo_threshold: float = 0.15,
+                             ice_frac: np.ndarray | None = None,
+                             h_ice: np.ndarray | None = None,
+                             H_ref: float = 0.5,
+                             h0: float = 0.05,
+                             gamma: float = 1.0):
+    """
+    Calculates dynamic albedo. Supports either:
+      - A smooth temperature-based sea-ice transition (default), or
+      - An externally provided ice fraction (ice_frac in [0,1], e.g., from h_ice).
+
+    Optionally restricts sea-ice formation to ocean points.
+
+    Args:
+        cloud_cover (np.ndarray): Cloud cover fraction field in [0,1].
+        T_s (np.ndarray or float): Surface temperature field (K), broadcastable.
+        base_albedo (float or np.ndarray): Baseline surface albedo (water/land or 2D map).
+        alpha_ice (float): Albedo of ice (sea-ice or snow/ice).
+        alpha_cloud (float): Albedo of clouds.
+        land_mask (np.ndarray, optional): 1=land, 0=ocean. If provided and ice_only_over_ocean=True,
+                                          ice is only allowed over ocean points.
+        t_freeze (float): Freezing temperature (K) for temperature-based transition center.
+        delta_T (float): Transition half-width (K) for temperature-based transition.
+        ice_only_over_ocean (bool): If True, ice transition applies only to ocean points.
+        ocean_albedo_threshold (float): When land_mask is None but base_albedo is a 2D map,
+                                        use base_albedo < threshold to approximate ocean.
+        ice_frac (np.ndarray|None): If provided, use this [0,1] field as ice fraction instead of
+                                    computing from temperature.
+
+    Returns:
+        np.ndarray: Dynamic albedo field in [0,1].
+    """
+    import numpy as np
+
+    # Ensure arrays
+    T_s_arr = np.asarray(T_s, dtype=float)
+    C = np.clip(np.asarray(cloud_cover, dtype=float), 0.0, 1.0)
+
+    # Prepare base albedo as array
+    if isinstance(base_albedo, np.ndarray):
+        base = base_albedo.astype(float)
+    else:
+        base = np.full_like(T_s_arr, float(base_albedo), dtype=float)
+
+    # Determine ice fraction priority:
+    # 1) externally provided ice_frac in [0,1]
+    # 2) from thickness h_ice via saturating law with threshold h0 and e-folding H_ref
+    # 3) fallback: temperature-based smooth transition around t_freeze
+    if ice_frac is not None:
+        ice_frac_local = np.clip(np.asarray(ice_frac, dtype=float), 0.0, 1.0)
+    elif h_ice is not None:
+        h = np.maximum(np.asarray(h_ice, dtype=float) - float(h0), 0.0)
+        # Thin ice has weak optical effect; saturates for thick ice
+        eff = 1.0 - np.exp(-h / max(1e-6, float(H_ref)))
+        # Optional nonlinearity control
+        eff = np.clip(eff, 0.0, 1.0) ** float(gamma)
+        ice_frac_local = eff
+    else:
+        eps = max(1e-6, float(delta_T))
+        ice_frac_local = 0.5 * (1.0 + np.tanh((t_freeze - T_s_arr) / eps))
+
+    # Optionally limit ice to ocean
+    if ice_only_over_ocean:
+        if land_mask is not None:
+            ocean_mask = (land_mask == 0)
+        else:
+            if isinstance(base_albedo, np.ndarray):
+                ocean_mask = (base < float(ocean_albedo_threshold))
+            else:
+                ocean_mask = np.ones_like(T_s_arr, dtype=bool)
+        ice_frac_local = ice_frac_local * ocean_mask
+
+    # Combine base and ice albedos (pre-cloud)
+    surface_albedo = base * (1.0 - ice_frac_local) + float(alpha_ice) * ice_frac_local
+
+    # Mix with cloud albedo
+    albedo = surface_albedo * (1.0 - C) + float(alpha_cloud) * C
+    return np.clip(albedo, 0.0, 1.0)

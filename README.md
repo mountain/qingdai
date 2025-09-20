@@ -40,11 +40,39 @@
   - `python3 -m scripts.plot_topography`
   - 将在 `data/` 生成对应的 `*_overview.png`
 
+- 运行 GCM（使用外部地形 NetCDF 与可选地形降水）：
+  - 使用 data 下最新 topography：
+    - `export QD_TOPO_NC=$(ls -t data/*.nc | head -n1)`
+    - `export QD_USE_TOPO_ALBEDO=1`
+    - （可选）开启地形降水增强：
+      - `export QD_OROG=1`
+      - `export QD_OROG_K=7e-4`
+    - 运行：
+      - `python3 -m scripts.run_simulation`
+  - 不使用外部 NetCDF（回退到内置生成）：
+    - 不设置 `QD_TOPO_NC`，直接运行：
+      - `python3 -m scripts.run_simulation`
+  - 其它运行控制（环境变量）：
+    - `QD_SIM_DAYS`：模拟时长（单位：行星日，默认 ≈5 个公转周期）
+    - `QD_PLOT_EVERY_DAYS`：出图间隔（单位：行星日，默认 10）
+    - `QD_DT_SECONDS`：积分步长（秒）
+    - 云与降水参数：`QD_CMAX`、`QD_PREF`、`QD_W_MEM`、`QD_W_P`、`QD_W_SRC`
+    - 能量框架（P006）：`QD_ENERGY_W`（0..1，能量收支权重）、`QD_ENERGY_DIAG`（能量诊断）、`QD_T_FLOOR`（夜侧温度下限）
+    - 湿度–云一致性（P008 M4）：`QD_CLOUD_COUPLE`（启用耦合）、`QD_RH0`、`QD_K_Q`、`QD_K_P`、`QD_PCOND_REF`
+    - 水文闭合与径流（P009）：`QD_WATER_DIAG`（水量诊断）、`QD_RUNOFF_TAU_DAYS`（径流时标/天）、`QD_WLAND_CAP`（陆地水库容量/毫米，可选）、`QD_SNOW_THRESH`（雨雪阈值/K）、`QD_SNOW_MELT_RATE`（融雪速率/毫米·天⁻¹）
+    - 说明：脚本启动时会打印地形来源、海陆比例、反照率/摩擦统计等日志，便于检查。
+
+
 参考阅读：
 1.  **了解世界观**: 阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)
 2.  **理解物理模型**: 浏览 [docs/02-orbital-dynamics.md](./docs/02-orbital-dynamics.md) 和 [docs/03-climate-model.md](./docs/03-climate-model.md)
 3.  **查看项目规划**: 阅读 [projects/001-genesis.md](./projects/001-genesis.md)
-4.  **当前项目状态与设计细节（P004）**: [projects/004-topography-generation.md](./projects/004-topography-generation.md)
+4.  **行星地形生成（P004）**: [projects/004-topography-generation.md](./projects/004-topography-generation.md)
+5.  **地形接入 GCM（P005）**: [projects/005-topography-integration-into-gcm.md](./projects/005-topography-integration-into-gcm.md)
+6.  **能量收支框架（P006）**: [projects/006-energy-budget.md](./projects/006-energy-budget.md)
+7.  **平板海洋与海冰（P007）**: [projects/007-slab-ocean.md](./projects/007-slab-ocean.md)
+8.  **大气湿度与E–P–LH闭环（P008）**: [projects/008-humidity.md](./projects/008-humidity.md)
+9.  **行星水循环闭合（P009）**: [projects/009-planetary-hydrology.md](./projects/009-planetary-hydrology.md)
 
 ## 🤝 贡献
 

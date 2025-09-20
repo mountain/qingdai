@@ -384,3 +384,155 @@ def export_topography_to_netcdf(grid,
         ds.planet_radius_m = constants.PLANET_RADIUS
         ds.planet_omega_rad_s = constants.PLANET_OMEGA
         ds.planet_axial_tilt_deg = constants.PLANET_AXIAL_TILT
+
+# ----------------------------
+# NetCDF Load & Regrid
+# ----------------------------
+def load_topography_from_netcdf(path: str, grid, *, regrid: str = "auto"):
+    """
+    Load topography and surface properties from a NetCDF file and (optionally) regrid to the model grid.
+
+    Args:
+        path (str): Path to NetCDF file produced by export_topography_to_netcdf or compatible layout.
+        grid (SphericalGrid): Target grid to map fields onto.
+        regrid (str): "auto" (default) attempts bilinear (nearest for mask) if grids differ; "never" to require exact match.
+
+    Returns:
+        (elevation, land_mask, base_albedo, friction): 2D arrays aligned to 'grid' resolution.
+    """
+    try:
+        from netCDF4 import Dataset
+    except Exception as e:
+        raise RuntimeError("netCDF4 is required to load topography. Please install 'netCDF4'.") from e
+
+    import numpy as np
+    try:
+        from scipy.interpolate import RegularGridInterpolator
+    except Exception as e:
+        raise RuntimeError("SciPy is required for regridding. Please install 'scipy'.") from e
+
+    def _to_0360(lon_arr):
+        lon = np.asarray(lon_arr, dtype=float).copy()
+        lon = np.mod(lon, 360.0)
+        lon[lon < 0] += 360.0
+        return lon
+
+    def _prepare_src_coords(ds):
+        lat = np.asarray(ds["lat"][:], dtype=float)
+        lon = np.asarray(ds["lon"][:], dtype=float)
+
+        # Normalize longitude to [0,360)
+        if np.nanmin(lon) < 0.0 or np.nanmax(lon) <= 180.0:
+            lon = _to_0360(lon)
+
+        # Ensure strictly increasing coordinates for interpolator
+        lat_increasing = np.all(np.diff(lat) > 0)
+        if not lat_increasing:
+            lat = lat[::-1]
+        # Sort longitude ascending and roll fields accordingly later
+        lon_sort_idx = np.argsort(lon)
+        lon = lon[lon_sort_idx]
+        return lat, lon, lat_increasing, lon_sort_idx
+
+    def _read_field(ds, name, lat_increasing, lon_sort_idx):
+        arr = np.asarray(ds[name][:])
+        # Reorder dims if necessary to (lat, lon)
+        # Convention here is already (lat, lon) as written by our exporter.
+        # Fix latitude descending
+        if not lat_increasing:
+            arr = arr[::-1, :]
+        # Sort longitude
+        arr = arr[:, lon_sort_idx]
+        return arr
+
+    def _interp_field(src_lat, src_lon, src_field, tgt_lat_mesh, tgt_lon_mesh, method="linear", is_mask=False):
+        # Build cyclic extension in longitude to avoid seam artifacts
+        lon_ext = np.concatenate([src_lon - 360.0, src_lon, src_lon + 360.0])
+        field_ext = np.concatenate([src_field, src_field, src_field], axis=1)
+
+        # Interpolator requires strictly increasing coords
+        interp = RegularGridInterpolator(
+            (src_lat, lon_ext), field_ext,
+            bounds_error=False,
+            fill_value=None,
+            method=("nearest" if is_mask else method)
+        )
+
+        # Query points
+        pts_lat = tgt_lat_mesh.ravel()
+        pts_lon = tgt_lon_mesh.ravel()
+        # Clip latitude to source bounds to avoid None
+        pts_lat = np.clip(pts_lat, src_lat.min(), src_lat.max())
+
+        vals = interp(np.stack([pts_lat, pts_lon], axis=-1)).reshape(tgt_lat_mesh.shape)
+
+        if is_mask:
+            # Force binary after nearest
+            vals = np.where(vals >= 0.5, 1, 0).astype(np.uint8)
+        else:
+            # If any NaNs occurred (e.g., outside bounds), fall back to nearest for those pixels
+            if np.any(~np.isfinite(vals)):
+                interp_nn = RegularGridInterpolator(
+                    (src_lat, lon_ext), field_ext,
+                    bounds_error=False,
+                    fill_value=None,
+                    method="nearest"
+                )
+                nn_vals = interp_nn(np.stack([pts_lat, pts_lon], axis=-1)).reshape(tgt_lat_mesh.shape)
+                vals = np.where(np.isfinite(vals), vals, nn_vals)
+
+        return vals
+
+    with Dataset(path, "r") as ds:
+        src_lat, src_lon, lat_increasing, lon_sort_idx = _prepare_src_coords(ds)
+
+        elev = _read_field(ds, "elevation", lat_increasing, lon_sort_idx)
+        mask = _read_field(ds, "land_mask", lat_increasing, lon_sort_idx)
+        base = _read_field(ds, "base_albedo", lat_increasing, lon_sort_idx)
+        fric = _read_field(ds, "friction", lat_increasing, lon_sort_idx)
+
+        # Remove duplicate seam if present (e.g., lon includes both 0 and 360)
+        if src_lon.size >= 2 and (np.isclose(src_lon[0], 0.0) and np.isclose(src_lon[-1], 360.0)):
+            src_lon = src_lon[:-1]
+            elev = elev[:, :-1]
+            mask = mask[:, :-1]
+            base = base[:, :-1]
+            fric = fric[:, :-1]
+
+        # Quick exact-shape match path
+        same_shape = (elev.shape == (grid.n_lat, grid.n_lon))
+        if same_shape:
+            # Also check coords close
+            if regrid == "never" or (
+                np.allclose(src_lat, grid.lat, atol=1e-6) and np.allclose(src_lon, grid.lon, atol=1e-6)
+            ):
+                elevation = elev.astype(float)
+                land_mask = mask.astype(np.uint8)
+                base_albedo = base.astype(float)
+                friction = fric.astype(float)
+            else:
+                # Shapes match but coords differ slightly; treat as regrid
+                elevation = _interp_field(src_lat, src_lon, elev, grid.lat_mesh, grid.lon_mesh, method="linear", is_mask=False)
+                land_mask = _interp_field(src_lat, src_lon, mask, grid.lat_mesh, grid.lon_mesh, method="nearest", is_mask=True)
+                base_albedo = _interp_field(src_lat, src_lon, base, grid.lat_mesh, grid.lon_mesh, method="linear", is_mask=False)
+                friction = _interp_field(src_lat, src_lon, fric, grid.lat_mesh, grid.lon_mesh, method="linear", is_mask=False)
+        else:
+            if regrid == "never":
+                raise ValueError(f"Topography grid mismatch: source {elev.shape} vs target {(grid.n_lat, grid.n_lon)} and regrid='never'.")
+            elevation = _interp_field(src_lat, src_lon, elev, grid.lat_mesh, grid.lon_mesh, method="linear", is_mask=False)
+            land_mask = _interp_field(src_lat, src_lon, mask, grid.lat_mesh, grid.lon_mesh, method="nearest", is_mask=True)
+            base_albedo = _interp_field(src_lat, src_lon, base, grid.lat_mesh, grid.lon_mesh, method="linear", is_mask=False)
+            friction = _interp_field(src_lat, src_lon, fric, grid.lat_mesh, grid.lon_mesh, method="linear", is_mask=False)
+
+    # Basic sanity/logging
+    lat_rad = np.deg2rad(grid.lat_mesh)
+    area_w = np.cos(lat_rad)
+    achieved = float((area_w * (land_mask == 1)).sum() / (area_w.sum() + 1e-15))
+    print(f"[Topo] Loaded: {path}")
+    print(f"[Topo] Land fraction (achieved): {achieved:.3f}")
+    print(f"[Topo] Albedo stats (min/mean/max): {np.nanmin(base_albedo):.3f}/{np.nanmean(base_albedo):.3f}/{np.nanmax(base_albedo):.3f}")
+    print(f"[Topo] Friction stats (min/mean/max): {np.nanmin(friction):.2e}/{np.nanmean(friction):.2e}/{np.nanmax(friction):.2e}")
+    if np.isfinite(elevation).any():
+        print(f"[Topo] Elevation stats (m): {np.nanmin(elevation):.1f}/{np.nanmean(elevation):.1f}/{np.nanmax(elevation):.1f}")
+
+    return elevation, land_mask, base_albedo, friction
