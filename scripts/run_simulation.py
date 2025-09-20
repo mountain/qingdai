@@ -18,25 +18,35 @@ from pygcm.grid import SphericalGrid
 from pygcm.orbital import OrbitalSystem
 from pygcm.forcing import ThermalForcing
 from pygcm.dynamics import SpectralModel
+from pygcm.topography import create_land_sea_mask, generate_base_properties
 
-def plot_state(grid, gcm, t_days, output_dir):
+def plot_state(grid, gcm, land_mask, t_days, output_dir):
     """
     Generates and saves a plot of the current model state.
     """
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), constrained_layout=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15), constrained_layout=True)
     fig.suptitle(f"Qingdai GCM State at Day {t_days:.2f}", fontsize=16)
 
-    # 1. Plot Geopotential Height Anomaly
-    h_plot = ax1.contourf(grid.lon, grid.lat, gcm.h, levels=20, cmap='RdBu_r')
-    ax1.set_title("Geopotential Height Anomaly (m)")
+    # 1. Plot Surface Temperature and Land Mask
+    ts_plot = ax1.contourf(grid.lon, grid.lat, gcm.T_s - 273.15, levels=20, cmap='coolwarm')
+    ax1.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=2)
+    ax1.set_title("Surface Temperature (°C) and Continents")
     ax1.set_xlabel("Longitude")
     ax1.set_ylabel("Latitude")
-    fig.colorbar(h_plot, ax=ax1, label="Height (m)")
+    fig.colorbar(ts_plot, ax=ax1, label="Temperature (°C)")
 
-    # 2. Plot Wind Field (Streamline plot)
+    # 2. Plot Geopotential Height Anomaly
+    h_plot = ax2.contourf(grid.lon, grid.lat, gcm.h, levels=20, cmap='RdBu_r')
+    ax2.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=2)
+    ax2.set_title("Geopotential Height Anomaly (m)")
+    ax2.set_xlabel("Longitude")
+    ax2.set_ylabel("Latitude")
+    fig.colorbar(h_plot, ax=ax2, label="Height (m)")
+
+    # 3. Plot Wind Field (Streamline plot)
     speed = np.sqrt(gcm.u**2 + gcm.v**2)
-    ax2.streamplot(grid.lon, grid.lat, gcm.u, gcm.v, color=speed, cmap='viridis', density=2)
-    ax2.set_title("Wind Field Streamlines (m/s)")
+    ax3.streamplot(grid.lon, grid.lat, gcm.u, gcm.v, color=speed, cmap='viridis', density=2)
+    ax3.set_title("Wind Field Streamlines (m/s)")
     ax2.set_xlabel("Longitude")
     ax2.set_ylabel("Latitude")
     ax2.set_xlim(0, 360)
@@ -57,21 +67,25 @@ def main():
     print("Creating grid...")
     grid = SphericalGrid(n_lat=121, n_lon=240)
 
+    print("Creating topography...")
+    land_mask = create_land_sea_mask(grid)
+    base_albedo_map, friction_map = generate_base_properties(land_mask)
+
     print("Initializing orbital mechanics...")
     orbital_sys = OrbitalSystem()
 
-    print("Initializing thermal forcing...")
-    forcing = ThermalForcing(grid, orbital_sys)
+    print("Initializing thermal forcing with dynamic albedo...")
+    forcing = ThermalForcing(grid, orbital_sys, base_albedo_map)
 
-    print("Initializing dynamics core (Spectral Model)...")
-    gcm = SpectralModel(grid, H=8000, tau_rad=10 * 24 * 3600) # 10 day relaxation
+    print("Initializing dynamics core with surface friction and greenhouse effect...")
+    gcm = SpectralModel(grid, friction_map, H=8000, tau_rad=10 * 24 * 3600, greenhouse_factor=0.2)
 
     # --- Simulation Parameters ---
     dt = 300  # Time step in seconds (5 minutes)
     
-    # Simulate for one full planetary year
+    # Simulate for 5 planetary years
     day_in_seconds = 2 * np.pi / constants.PLANET_OMEGA
-    sim_duration_seconds = orbital_sys.T_planet
+    sim_duration_seconds = 5 * orbital_sys.T_planet
     
     time_steps = np.arange(0, sim_duration_seconds, dt)
 
@@ -100,8 +114,8 @@ def main():
         iterator = time_steps
 
     for i, t in enumerate(iterator):
-        # 1. Calculate thermal forcing for the current time
-        Teq = forcing.calculate_equilibrium_temp(t)
+        # 1. Calculate thermal forcing for the current time, now dependent on T_s
+        Teq = forcing.calculate_equilibrium_temp(t, gcm.T_s)
 
         # 2. Advance the GCM state by one time step
         gcm.time_step(Teq, dt)
@@ -118,7 +132,7 @@ def main():
         
         # Generate plot at specified interval
         if i % plot_interval_steps == 0:
-            plot_state(grid, gcm, t_days, output_dir)
+            plot_state(grid, gcm, land_mask, t_days, output_dir)
 
 
     print("\n--- Simulation Finished ---")

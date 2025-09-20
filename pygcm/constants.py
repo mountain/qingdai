@@ -28,8 +28,8 @@ M_TOTAL_STARS = M_A + M_B
 A_BINARY = 0.5 * AU  # Semi-major axis of the binary pair
 
 # --- Qingdai Planet Parameters ---
-A_PLANET = 1.5 * AU      # Semi-major axis of the planet's orbit
+A_PLANET = 1.30 * AU     # Semi-major axis of the planet's orbit (final, final tuning)
 PLANET_RADIUS = 6.371e6  # Planet radius (m, Earth-like for now)
 PLANET_ALBEDO = 0.3      # Planetary albedo (Earth-like for now)
-PLANET_OMEGA = 7.292e-5  # Angular velocity (rad/s, Earth-like for now)
-PLANET_AXIAL_TILT = 28.0 # Axial tilt in degrees
+PLANET_OMEGA = 5.818e-5  # Angular velocity (rad/s, for a 30-hour day)
+PLANET_AXIAL_TILT = 27.0 # Axial tilt in degrees

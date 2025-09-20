@@ -13,18 +13,19 @@ class ThermalForcing:
     """
     Calculates the dynamic equilibrium temperature field for the planet.
     """
-    def __init__(self, grid: SphericalGrid, orbital_system: OrbitalSystem):
+    def __init__(self, grid: SphericalGrid, orbital_system: OrbitalSystem, base_albedo_map: np.ndarray):
         """
         Initializes the thermal forcing module.
 
         Args:
             grid (SphericalGrid): The model's grid system.
             orbital_system (OrbitalSystem): The orbital system providing energy flux.
+            base_albedo_map (np.ndarray): A 2D array of ice-free surface albedo.
         """
         self.grid = grid
         self.orbital_system = orbital_system
+        self.base_albedo_map = base_albedo_map
         self.planet_params = {
-            'albedo': const.PLANET_ALBEDO,
             'axial_tilt': const.PLANET_AXIAL_TILT,
             'omega': const.PLANET_OMEGA,
             'T_planet': self.orbital_system.T_planet
@@ -75,23 +76,34 @@ class ThermalForcing:
         insolation = s_total * cos_z
         return insolation
 
-    def calculate_equilibrium_temp(self, t):
+    def _calculate_dynamic_albedo(self, T_s):
+        """Calculates the albedo, accounting for ice formation."""
+        albedo_ice = 0.6
+        freezing_point = 273.15
+        # Where surface temperature is below freezing, albedo increases to ice_albedo
+        ice_mask = T_s < freezing_point
+        dynamic_albedo = np.where(ice_mask, albedo_ice, self.base_albedo_map)
+        return dynamic_albedo
+
+    def calculate_equilibrium_temp(self, t, T_s):
         """
         Calculates the global radiative equilibrium temperature field T_eq
-        for a given time t.
+        for a given time t, considering the current surface temperature for albedo.
 
         Args:
             t (float): Time in seconds.
+            T_s (np.ndarray): Current surface temperature field (K).
 
         Returns:
             np.ndarray: A 2D array of equilibrium temperatures (K) on the grid.
         """
         insolation = self.calculate_insolation(t)
+        dynamic_albedo = self._calculate_dynamic_albedo(T_s)
         
         # Stefan-Boltzmann Law: I * (1 - albedo) = sigma * T^4
         # T = (I * (1 - albedo) / sigma)^(1/4)
         
-        numerator = insolation * (1 - self.planet_params['albedo'])
+        numerator = insolation * (1 - dynamic_albedo)
         # Avoid division by zero or negative roots for the night side
         # Where insolation is zero, temperature should be zero (or a minimum background temp)
         # For now, we'll let it be zero.
@@ -107,13 +119,18 @@ if __name__ == '__main__':
     # Example usage
     grid = SphericalGrid(n_lat=73, n_lon=144)
     orbital_sys = OrbitalSystem()
-    forcing = ThermalForcing(grid, orbital_sys)
+    # Create a dummy uniform albedo map for testing
+    base_albedo_map = np.full(grid.lat_mesh.shape, const.PLANET_ALBEDO)
+    forcing = ThermalForcing(grid, orbital_sys, base_albedo_map)
 
     # Calculate for a specific time (e.g., one quarter into the orbit)
     time_t = orbital_sys.T_planet / 4.0
     
+    # Dummy surface temperature for testing
+    dummy_T_s = np.full(grid.lat_mesh.shape, 288.0)
+    
     insolation_field = forcing.calculate_insolation(time_t)
-    temp_eq_field = forcing.calculate_equilibrium_temp(time_t)
+    temp_eq_field = forcing.calculate_equilibrium_temp(time_t, dummy_T_s)
 
     print(f"Calculating for time t = {time_t / (3600*24):.1f} days")
     print("Insolation field shape:", insolation_field.shape)

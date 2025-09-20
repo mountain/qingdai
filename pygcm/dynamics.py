@@ -14,11 +14,13 @@ class SpectralModel:
     A spectral shallow water model that solves the equations of motion in
     spectral space using spherical harmonics.
     """
-    def __init__(self, grid: SphericalGrid, initial_state=None, g=9.81, H=8000, tau_rad=1e6):
+    def __init__(self, grid: SphericalGrid, friction_map: np.ndarray, initial_state=None, g=9.81, H=8000, tau_rad=1e6, greenhouse_factor=0.15):
         self.grid = grid
+        self.friction_map = friction_map
         self.g = g
         self.H = H
         self.tau_rad = tau_rad
+        self.greenhouse_factor = greenhouse_factor
         self.a = const.PLANET_RADIUS
         
         # Spectral truncation (lower for stability and speed)
@@ -37,6 +39,7 @@ class SpectralModel:
         self.u = np.zeros(self.grid.lat_mesh.shape, dtype=float)
         self.v = np.zeros(self.grid.lat_mesh.shape, dtype=float)
         self.h = np.full(self.grid.lat_mesh.shape, self.H, dtype=float)
+        self.T_s = np.full(self.grid.lat_mesh.shape, 288.0, dtype=float) # Initial surface temp of 288K
 
     def _grid_to_spectral(self, data):
         """Transforms data from grid-point space to spectral space."""
@@ -73,15 +76,37 @@ class SpectralModel:
         
         # --- Simplified, Stabilized Grid-Point Model ---
         
-        # 1. Calculate forcing
+        # 1. Calculate atmospheric temperature from height anomaly
+        # T_a = T_ref + (g/Cp) * h, a simplification
+        T_a = 288.0 + (self.g / 1004.0) * self.h
+
+        # 2. Update Surface Temperature using a proper energy balance model
+        
+        # Absorbed shortwave radiation at the surface, derived from Teq
+        # Teq = (Insolation * (1-albedo) / sigma)^1/4  => Insolation * (1-albedo) = sigma * Teq^4
+        absorbed_solar = const.SIGMA * Teq_field**4
+        
+        # Outgoing longwave radiation from the surface
+        olr = const.SIGMA * self.T_s**4
+        
+        # Incoming longwave from the atmosphere (greenhouse effect)
+        ilr = self.greenhouse_factor * const.SIGMA * T_a**4
+        
+        # Net radiation flux into the surface
+        net_flux = absorbed_solar + ilr - olr
+        
+        # Update surface temperature based on the net flux
+        heat_capacity_sfc = 2e7 # J/m^2/K for a ~5m ocean mixed layer
+        dT_s = net_flux / heat_capacity_sfc
+        self.T_s += dT_s * dt
+        
+        # 3. Add radiative forcing to height field
         R_gas = 287
         h_eq = (R_gas / self.g) * Teq_field
         rad_forcing = (h_eq - self.h) / self.tau_rad
-        
-        # 2. Add forcing to height field
         self.h += rad_forcing * dt
         
-        # 3. Relaxation to a state of geostrophic balance
+        # 4. Relaxation to a state of geostrophic balance
         # This is a massive simplification, but it is guaranteed to be stable.
         # It assumes that the flow is always close to a balance between
         # the pressure gradient and Coriolis forces.
@@ -112,6 +137,12 @@ class SpectralModel:
         self.u = self.u * 0.95 + u_g * 0.05
         self.v = self.v * 0.95 + v_g * 0.05
         
+        # Add surface friction, which is stronger over land
+        friction_drag_u = -self.friction_map * self.u
+        friction_drag_v = -self.friction_map * self.v
+        self.u += friction_drag_u * dt
+        self.v += friction_drag_v * dt
+        
         # Simple diffusion to keep things smooth
         self.u = self.u * 0.99
         self.v = self.v * 0.99
@@ -121,3 +152,4 @@ class SpectralModel:
         self.u = np.nan_to_num(self.u)
         self.v = np.nan_to_num(self.v)
         self.h = np.nan_to_num(self.h)
+        self.T_s = np.nan_to_num(self.T_s)
