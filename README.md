@@ -80,7 +80,7 @@
 11. **更好的动力学/反噪（P010）**: [projects/010-better-dynamics.md](./projects/010-better-dynamics.md)
 12. **动态洋流（P011）**: [projects/011-ocean-model.md](./projects/011-ocean-model.md)
 13. **极点处理（P012）**: [projects/012-polar-treatment.md](./projects/012-polar-treatment.md)
-14. **快速自旋（P013）**: [projects/013-spin-up.md](./projects/013-spin-up.md)
+14. **快速初始化（P013）**: [projects/013-spin-up.md](./projects/013-spin-up.md)
 
 ## 🤝 贡献
 
