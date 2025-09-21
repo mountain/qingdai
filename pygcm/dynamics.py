@@ -451,48 +451,55 @@ class SpectralModel:
         except Exception:
             pass
         
-        # 4. Relaxation to a state of geostrophic balance
-        # This is a massive simplification, but it is guaranteed to be stable.
-        # It assumes that the flow is always close to a balance between
-        # the pressure gradient and Coriolis forces.
-        
+        # 4. Momentum step: pressure-gradient force + Coriolis (+ friction)
+        # Support two schemes via env QD_MOM_SCHEME: "primitive" (du/dt explicit) or "geos" (relaxation).
+        mom_scheme = os.getenv("QD_MOM_SCHEME", "geos").lower()
         f = self.grid.coriolis_param
-        
-        # Geostrophic winds (u_g, v_g)
-        dh_dlon = np.gradient(self.h, self.dlon_rad, axis=1)
-        dh_dlat = np.gradient(self.h, self.dlat_rad, axis=0)
-        
-        u_g = np.zeros_like(self.h)
-        v_g = np.zeros_like(self.h)
-        
-        # Regularize f near the equator: enforce a minimum |f| equivalent to 5° latitude
-        f_min = 2.0 * const.PLANET_OMEGA * np.sin(np.deg2rad(5.0))
-        # Use a non-zero sign at the equator to avoid f_safe == 0
-        sign_nonzero = np.where(f >= 0.0, 1.0, -1.0)
-        f_safe = np.where(np.abs(f) < f_min, sign_nonzero * f_min, f)
 
-        # Cap cos(lat) to avoid division by zero at the poles
+        # Common metrics and gradients
+        dh_dlon = np.gradient(self.h, self.dlon_rad, axis=1)   # ∂h/∂λ
+        dh_dlat = np.gradient(self.h, self.dlat_rad, axis=0)   # ∂h/∂φ
         cos_lat_capped = np.maximum(np.cos(np.deg2rad(self.grid.lat_mesh)), 1e-6)
-        
-        u_g = -(self.g / (f_safe * self.a * cos_lat_capped)) * dh_dlat
-        v_g = (self.g / (f_safe * self.a)) * dh_dlon
 
-        # Cap geostrophic wind magnitudes to prevent numerical blow-up
-        max_wind = 200.0  # m/s
-        u_g = np.clip(u_g, -max_wind, max_wind)
-        v_g = np.clip(v_g, -max_wind, max_wind)
-        
-        
-        # Nudge the current winds towards the geostrophic winds
-        # This is a stable, albeit physically simplified, way to simulate flow.
-        self.u = self.u * 0.8 + u_g * 0.2
-        self.v = self.v * 0.8 + v_g * 0.2
-        
-        # Add surface friction, which is stronger over land
-        friction_drag_u = -self.friction_map * self.u
-        friction_drag_v = -self.friction_map * self.v
-        self.u += friction_drag_u * dt
-        self.v += friction_drag_v * dt
+        if mom_scheme == "primitive":
+            # Primitive-momentum (linearized shallow-water):
+            # du/dt = -g/(a cosφ) ∂h/∂λ + f v - r u
+            # dv/dt = -g/a ∂h/∂φ - f u - r v
+            u_old = self.u.copy()
+            v_old = self.v.copy()
+
+            PGF_x = -(self.g / (self.a * cos_lat_capped)) * dh_dlon
+            PGF_y = -(self.g / self.a) * dh_dlat
+            # Coriolis terms are perpendicular to velocity and proportional to speed
+            du = (PGF_x + f * v_old - self.friction_map * u_old) * dt
+            dv = (PGF_y - f * u_old - self.friction_map * v_old) * dt
+
+            self.u = u_old + du
+            self.v = v_old + dv
+
+            # Clip winds for stability
+            max_wind = 200.0
+            self.u = np.clip(self.u, -max_wind, max_wind)
+            self.v = np.clip(self.v, -max_wind, max_wind)
+
+        else:
+            # Geostrophic relaxation (legacy default; numerically robust)
+            # Regularize f near equator
+            f_min = 2.0 * const.PLANET_OMEGA * np.sin(np.deg2rad(5.0))
+            sign_nonzero = np.where(f >= 0.0, 1.0, -1.0)
+            f_safe = np.where(np.abs(f) < f_min, sign_nonzero * f_min, f)
+            # Geostrophic winds from balance: f k×V = -g ∇h
+            u_g = -(self.g / (f_safe * self.a * cos_lat_capped)) * dh_dlat
+            v_g = (self.g / (f_safe * self.a)) * dh_dlon
+            max_wind = 200.0
+            u_g = np.clip(u_g, -max_wind, max_wind)
+            v_g = np.clip(v_g, -max_wind, max_wind)
+            # Nudge towards geostrophic
+            self.u = self.u * 0.8 + u_g * 0.2
+            self.v = self.v * 0.8 + v_g * 0.2
+            # Apply linear friction after nudging (stronger over land via map)
+            self.u += (-self.friction_map * self.u) * dt
+            self.v += (-self.friction_map * self.v) * dt
 
         # ---------------- Project 010: Scale-selective dissipation (hyperdiffusion) ----------------
         try:

@@ -24,6 +24,101 @@ from pygcm.hydrology import get_hydrology_params_from_env, partition_precip_phas
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
 
+# --- Restart I/O (NetCDF) and Initialization Helpers ---
+
+def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None):
+    """
+    Save minimal prognostic state to a NetCDF restart file.
+    Includes: lat/lon coords, u/v/h, T_s, cloud_cover, q (if exists), h_ice (if exists),
+              ocean state (uo/vo/eta/Ts if ocean provided),
+              hydrology reservoirs (W_land, S_snow) if provided.
+    """
+    from netCDF4 import Dataset
+    import numpy as np
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with Dataset(path, "w") as ds:
+        nlat, nlon = grid.n_lat, grid.n_lon
+        ds.createDimension("lat", nlat)
+        ds.createDimension("lon", nlon)
+        vlat = ds.createVariable("lat", "f4", ("lat",))
+        vlon = ds.createVariable("lon", "f4", ("lon",))
+        vlat[:] = grid.lat
+        vlon[:] = grid.lon
+
+        def wvar(name, data):
+            if data is None:
+                return
+            var = ds.createVariable(name, "f4", ("lat", "lon"))
+            var[:] = np.asarray(data, dtype=np.float32)
+
+        # Atmospheric / surface
+        wvar("u", gcm.u)
+        wvar("v", gcm.v)
+        wvar("h", gcm.h)
+        wvar("T_s", gcm.T_s)
+        wvar("cloud_cover", getattr(gcm, "cloud_cover", None))
+        wvar("q", getattr(gcm, "q", None))
+        wvar("h_ice", getattr(gcm, "h_ice", None))
+
+        # Ocean
+        if ocean is not None:
+            wvar("uo", getattr(ocean, "uo", None))
+            wvar("vo", getattr(ocean, "vo", None))
+            wvar("eta", getattr(ocean, "eta", None))
+            wvar("Ts", getattr(ocean, "Ts", None))
+
+        # Hydrology
+        wvar("W_land", W_land)
+        wvar("S_snow", S_snow)
+
+        # Masks for reference
+        wvar("land_mask", land_mask)
+
+        # Minimal metadata
+        ds.setncattr("title", "Qingdai GCM Restart")
+        ds.setncattr("creator", "PyGCM for Qingdai")
+        ds.setncattr("note", "Contains minimal prognostic fields for warm restart.")
+        ds.setncattr("format", "v1")
+
+def load_restart(path):
+    """
+    Load restart file and return a dict of arrays. Missing variables are returned as None.
+    """
+    from netCDF4 import Dataset
+    out = {}
+    with Dataset(path, "r") as ds:
+        def rvar(name):
+            try:
+                return ds.variables[name][:].data
+            except Exception:
+                return None
+        out["lat"] = ds.variables["lat"][:].data
+        out["lon"] = ds.variables["lon"][:].data
+        for name in ["u", "v", "h", "T_s", "cloud_cover", "q", "h_ice",
+                     "uo", "vo", "eta", "Ts", "W_land", "S_snow", "land_mask"]:
+            out[name] = rvar(name)
+    return out
+
+def apply_banded_initial_ts(grid, gcm, ocean, land_mask):
+    """
+    Apply latitudinally banded initial surface temperature:
+      T(φ) = T_pole + (T_eq - T_pole) * cos^2(φ)
+    Controlled by env: QD_INIT_BANDED=1, QD_INIT_T_EQ (K), QD_INIT_T_POLE (K).
+    """
+    if int(os.getenv("QD_INIT_BANDED", "0")) != 1:
+        return
+    T_eq = float(os.getenv("QD_INIT_T_EQ", "295.0"))
+    T_pole = float(os.getenv("QD_INIT_T_POLE", "265.0"))
+    phi = np.deg2rad(grid.lat_mesh)
+    Ts0 = T_pole + (T_eq - T_pole) * (np.cos(phi) ** 2)
+    # Apply to atmospheric surface temperature
+    gcm.T_s = Ts0.copy()
+    # If dynamic ocean is enabled, set SST over ocean (preserve land)
+    if ocean is not None:
+        ocean_mask = (land_mask == 0)
+        ocean.Ts = np.where(ocean_mask, Ts0, ocean.Ts)
+    print(f"[Init] Applied banded initial Ts: T_eq={T_eq} K, T_pole={T_pole} K")
+
 def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output_dir, ocean=None):
     """
     Generates and saves a 3-column x 5-row diagnostic plot of the current model state.
@@ -64,12 +159,20 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
     # 3) Sea-level pressure (hPa) from shallow-water mass (diagnostic)
     p0 = float(getattr(getattr(gcm, "hum_params", None), "p0", 1.0e5))
     rho_air = float(getattr(getattr(gcm, "hum_params", None), "rho_a", 1.2))
-    ps = p0 + rho_air * g_const * (gcm.h - float(getattr(gcm, "H", 8000.0)))
-    ps_hpa = ps * 1e-2
+    # Interpret h as thickness perturbation. Provide two plotting modes:
+    # - anom: pressure anomaly (hPa) = rho*g*h / 100
+    # - abs:  absolute pressure (hPa) = (p0 + rho*g*h) / 100
+    ps_mode = os.getenv("QD_PLOT_PS_MODE", "anom").lower()
+    if ps_mode == "abs":
+        ps_field = (p0 + rho_air * g_const * gcm.h) * 1e-2
+        title_ps = "Sea-level Pressure (hPa, diag)"
+    else:
+        ps_field = (rho_air * g_const * gcm.h) * 1e-2
+        title_ps = "Sea-level Pressure Anomaly (hPa, diag)"
     ax = axes[0, 2]
-    cs = ax.contourf(grid.lon, grid.lat, ps_hpa, levels=20, cmap="viridis")
+    cs = ax.contourf(grid.lon, grid.lat, ps_field, levels=20, cmap="viridis")
     ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
-    ax.set_title("Sea-level Pressure (hPa, diag)")
+    ax.set_title(title_ps)
     fig.colorbar(cs, ax=ax, label="hPa")
 
     # 4) SST
@@ -471,10 +574,43 @@ def main():
     _hydro_prev_total = None
     _hydro_prev_time = None
 
+    # --- Restart load or banded initialization ---
+    restart_in = os.getenv("QD_RESTART_IN")
+    if restart_in and os.path.exists(restart_in):
+        try:
+            rst = load_restart(restart_in)
+            # Basic shape checks (optional): assume matching grid
+            # Atmospheric / surface
+            if rst.get("u") is not None: gcm.u = rst["u"]
+            if rst.get("v") is not None: gcm.v = rst["v"]
+            if rst.get("h") is not None: gcm.h = rst["h"]
+            if rst.get("T_s") is not None: gcm.T_s = rst["T_s"]
+            if rst.get("cloud_cover") is not None: gcm.cloud_cover = np.clip(rst["cloud_cover"], 0.0, 1.0)
+            if rst.get("q") is not None and hasattr(gcm, "q"): gcm.q = rst["q"]
+            if rst.get("h_ice") is not None and hasattr(gcm, "h_ice"): gcm.h_ice = np.maximum(rst["h_ice"], 0.0)
+            # Ocean
+            if ocean is not None:
+                if rst.get("uo") is not None: ocean.uo = rst["uo"]
+                if rst.get("vo") is not None: ocean.vo = rst["vo"]
+                if rst.get("eta") is not None: ocean.eta = rst["eta"]
+                if rst.get("Ts") is not None: ocean.Ts = rst["Ts"]
+            # Hydrology
+            if rst.get("W_land") is not None: W_land = rst["W_land"]
+            if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
+            print(f"[Restart] Loaded state from '{restart_in}'.")
+        except Exception as e:
+            print(f"[Restart] Failed to load '{restart_in}': {e}\nContinuing with fresh init.")
+            apply_banded_initial_ts(grid, gcm, ocean, land_mask)
+    else:
+        apply_banded_initial_ts(grid, gcm, ocean, land_mask)
+
     # --- Simulation Parameters ---
     dt = int(os.getenv("QD_DT_SECONDS", "300"))  # default 300s
     day_in_seconds = 2 * np.pi / constants.PLANET_OMEGA
-    if os.getenv("QD_SIM_DAYS"):
+    # Duration priority: QD_TOTAL_YEARS -> QD_SIM_DAYS -> default (5 planetary years)
+    if os.getenv("QD_TOTAL_YEARS"):
+        sim_duration_seconds = float(os.getenv("QD_TOTAL_YEARS")) * orbital_sys.T_planet
+    elif os.getenv("QD_SIM_DAYS"):
         sim_duration_seconds = float(os.getenv("QD_SIM_DAYS")) * day_in_seconds
     else:
         sim_duration_seconds = 5 * orbital_sys.T_planet
@@ -800,6 +936,15 @@ def main():
             if PLOT_ISR:
                 plot_isr_components(grid, gcm, t_days, output_dir)
 
+
+    # --- Optional: Save restart at end ---
+    restart_out = os.getenv("QD_RESTART_OUT")
+    if restart_out:
+        try:
+            save_restart(restart_out, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow)
+            print(f"[Restart] Saved final state to '{restart_out}'.")
+        except Exception as e:
+            print(f"[Restart] Failed to save '{restart_out}': {e}")
 
     print("\n--- Simulation Finished ---")
     print("Final state diagnostics:")

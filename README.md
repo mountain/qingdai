@@ -19,7 +19,8 @@
 ├── docs/                   # 核心知识库与技术文档
 │   ├── 01-astronomical-setting.md
 │   ├── 02-orbital-dynamics.md
-│   └── 03-climate-model.md
+│   ├── 03-climate-model.md
+│   └── 04-runtime-config.md   # 运行配置与环境变量目录（新增）
 ├── projects/               # 项目高级规划与里程碑
 │   └── 001-genesis.md
 ├── pyproject.toml          # Python 项目配置文件 (待定)
@@ -68,14 +69,18 @@
 参考阅读：
 1.  **了解世界观**: 阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)
 2.  **理解物理模型**: 浏览 [docs/02-orbital-dynamics.md](./docs/02-orbital-dynamics.md) 和 [docs/03-climate-model.md](./docs/03-climate-model.md)
-3.  **查看项目规划**: 阅读 [projects/001-genesis.md](./projects/001-genesis.md)
-4.  **行星地形生成（P004）**: [projects/004-topography-generation.md](./projects/004-topography-generation.md)
-5.  **地形接入 GCM（P005）**: [projects/005-topography-integration-into-gcm.md](./projects/005-topography-integration-into-gcm.md)
-6.  **能量收支框架（P006）**: [projects/006-energy-budget.md](./projects/006-energy-budget.md)
-7.  **平板海洋与海冰（P007）**: [projects/007-slab-ocean.md](./projects/007-slab-ocean.md)
-8.  **大气湿度与E–P–LH闭环（P008）**: [projects/008-humidity.md](./projects/008-humidity.md)
-9.  **行星水循环闭合（P009）**: [projects/009-planetary-hydrology.md](./projects/009-planetary-hydrology.md)
-10. **更好的动力学/反噪（P010）**: [projects/010-better-dynamics.md](./projects/010-better-dynamics.md)
+3.  **运行配置与环境变量目录**: [docs/04-runtime-config.md](./docs/04-runtime-config.md)
+4.  **查看项目规划**: 阅读 [projects/001-genesis.md](./projects/001-genesis.md)
+5.  **行星地形生成（P004）**: [projects/004-topography-generation.md](./projects/004-topography-generation.md)
+6.  **地形接入 GCM（P005）**: [projects/005-topography-integration-into-gcm.md](./projects/005-topography-integration-into-gcm.md)
+7.  **能量收支框架（P006）**: [projects/006-energy-budget.md](./projects/006-energy-budget.md)
+8.  **平板海洋与海冰（P007）**: [projects/007-slab-ocean.md](./projects/007-slab-ocean.md)
+9.  **大气湿度与E–P–LH闭环（P008）**: [projects/008-humidity.md](./projects/008-humidity.md)
+10. **行星水循环闭合（P009）**: [projects/009-planetary-hydrology.md](./projects/009-planetary-hydrology.md)
+11. **更好的动力学/反噪（P010）**: [projects/010-better-dynamics.md](./projects/010-better-dynamics.md)
+12. **动态洋流（P011）**: [projects/011-ocean-model.md](./projects/011-ocean-model.md)
+13. **极点处理（P012）**: [projects/012-polar-treatment.md](./projects/012-polar-treatment.md)
+14. **快速自旋（P013）**: [projects/013-spin-up.md](./projects/013-spin-up.md)
 
 ## 🤝 贡献
 
