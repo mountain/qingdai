@@ -20,7 +20,15 @@
 │   ├── 01-astronomical-setting.md
 │   ├── 02-orbital-dynamics.md
 │   ├── 03-climate-model.md
-│   └── 04-runtime-config.md   # 运行配置与环境变量目录（新增）
+│   ├── 04-runtime-config.md   # 运行配置与环境变量目录
+│   ├── 05-surface-topography-and-albedo.md
+│   ├── 06-energy-framework.md
+│   ├── 07-ocean-and-sea-ice.md
+│   ├── 08-humidity-and-clouds.md
+│   ├── 09-hydrology-closure.md
+│   ├── 10-numerics-and-stability.md
+│   ├── 11-spin-up-and-restarts.md
+│   └── 12-code-architecture-and-apis.md
 ├── projects/               # 项目高级规划与里程碑
 │   └── 001-genesis.md
 ├── pyproject.toml          # Python 项目配置文件 (待定)
@@ -67,20 +75,17 @@
 
 
 参考阅读：
-1.  **了解世界观**: 阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)
-2.  **理解物理模型**: 浏览 [docs/02-orbital-dynamics.md](./docs/02-orbital-dynamics.md) 和 [docs/03-climate-model.md](./docs/03-climate-model.md)
-3.  **运行配置与环境变量目录**: [docs/04-runtime-config.md](./docs/04-runtime-config.md)
-4.  **查看项目规划**: 阅读 [projects/001-genesis.md](./projects/001-genesis.md)
-5.  **行星地形生成（P004）**: [projects/004-topography-generation.md](./projects/004-topography-generation.md)
-6.  **地形接入 GCM（P005）**: [projects/005-topography-integration-into-gcm.md](./projects/005-topography-integration-into-gcm.md)
-7.  **能量收支框架（P006）**: [projects/006-energy-budget.md](./projects/006-energy-budget.md)
-8.  **平板海洋与海冰（P007）**: [projects/007-slab-ocean.md](./projects/007-slab-ocean.md)
-9.  **大气湿度与E–P–LH闭环（P008）**: [projects/008-humidity.md](./projects/008-humidity.md)
-10. **行星水循环闭合（P009）**: [projects/009-planetary-hydrology.md](./projects/009-planetary-hydrology.md)
-11. **更好的动力学/反噪（P010）**: [projects/010-better-dynamics.md](./projects/010-better-dynamics.md)
-12. **动态洋流（P011）**: [projects/011-ocean-model.md](./projects/011-ocean-model.md)
-13. **极点处理（P012）**: [projects/012-polar-treatment.md](./projects/012-polar-treatment.md)
-14. **快速初始化（P013）**: [projects/013-spin-up.md](./projects/013-spin-up.md)
+1.  了解世界观与时间节律：阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)
+2.  轨道与气候模型框架：浏览 [docs/02-orbital-dynamics.md](./docs/02-orbital-dynamics.md) 与 [docs/03-climate-model.md](./docs/03-climate-model.md)
+3.  运行配置与环境变量目录： [docs/04-runtime-config.md](./docs/04-runtime-config.md)
+4.  地形与接入（P004/P005）：[docs/05-surface-topography-and-albedo.md](./docs/05-surface-topography-and-albedo.md)（设计细节参见 [projects/004](./projects/004-topography-generation.md)、[projects/005](./projects/005-topography-integration-into-gcm.md)）
+5.  能量收支（P006）：[docs/06-energy-framework.md](./docs/06-energy-framework.md)（方案详见 [projects/006](./projects/006-energy-budget.md)）
+6.  海洋与海冰/动态洋流/极点处理（P007/P011/P012）：[docs/07-ocean-and-sea-ice.md](./docs/07-ocean-and-sea-ice.md)（详见 [projects/007](./projects/007-slab-ocean.md)、[projects/011](./projects/011-ocean-model.md)、[projects/012](./projects/012-polar-treatment.md)）
+7.  湿度与云–辐射耦合（P003/P008）：[docs/08-humidity-and-clouds.md](./docs/08-humidity-and-clouds.md)（方案详见 [projects/003](./projects/003-cloud-precipitation-albedo.md)、[projects/008](./projects/008-humidity.md)）
+8.  水循环闭合（P009）：[docs/09-hydrology-closure.md](./docs/09-hydrology-closure.md)（详见 [projects/009](./projects/009-planetary-hydrology.md)）
+9.  数值稳定与反噪（P010）：[docs/10-numerics-and-stability.md](./docs/10-numerics-and-stability.md)（详见 [projects/010](./projects/010-better-dynamics.md)）
+10. 快速自旋与重启（P013）：[docs/11-spin-up-and-restarts.md](./docs/11-spin-up-and-restarts.md)（详见 [projects/013](./projects/013-spin-up.md)）
+11. 开发者指南/代码架构与 API（P002 + 实现）：[docs/12-code-architecture-and-apis.md](./docs/12-code-architecture-and-apis.md)（参见 [projects/002](./projects/002-physics-core.md)）
 
 ## 🤝 贡献
 
