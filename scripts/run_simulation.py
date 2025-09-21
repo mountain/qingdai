@@ -26,130 +26,180 @@ from pygcm.ocean import WindDrivenSlabOcean
 
 def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output_dir, ocean=None):
     """
-    Generates and saves a plot of the current model state.
+    Generates and saves a 3-column x 5-row diagnostic plot of the current model state.
+    Panels (left→right, top→bottom):
+      1) Ts (°C), 2) Ta (°C), 3) Sea-level Pressure (hPa)
+      4) SST (°C), 5) Precip (1-day, mm/day), 6) Cloud Cover
+      7) Wind (streamlines, m/s), 8) Ocean currents (m/s) or h anomaly, 9) Vorticity (1/s)
+      10) Incoming Shortwave (W/m²), 11) Dynamic Albedo, 12) OLR (W/m²)
+      13) Specific Humidity q (g/kg), 14) Evaporation E (mm/day), 15) Condensation P_cond (mm/day)
     """
-    # Layout: if ocean is provided, add two panels (SST and ocean currents)
-    if ocean is None:
-        fig, axes = plt.subplots(4, 2, figsize=(18, 20), constrained_layout=True)
-        fig.suptitle(f"Qingdai GCM State at Day {t_days:.2f}", fontsize=16)
-        ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8 = axes.flatten()
-        ax9 = ax10 = None
-    else:
-        fig, axes = plt.subplots(5, 2, figsize=(18, 24), constrained_layout=True)
-        fig.suptitle(f"Qingdai GCM State at Day {t_days:.2f}", fontsize=16)
-        a = axes.flatten()
-        ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8 = a[0:8]
-        ax9, ax10 = a[8], a[9]
+    fig, axes = plt.subplots(5, 3, figsize=(22, 28), constrained_layout=True)
+    fig.suptitle(f"Qingdai GCM State at Day {t_days:.2f}", fontsize=16)
 
-    # 1. Plot Surface Temperature and Land Mask（统一温度标尺）
-    # Prepare unified temperature range across Ts / Ta / SST (°C)
-    T_a_unified = 288.0 + (9.81 / 1004.0) * gcm.h
-    ta_c_unified = T_a_unified - 273.15
-    ts_c_unified = np.nan_to_num(gcm.T_s - 273.15)
-    if ocean is not None:
-        sst_c_unified = np.nan_to_num(ocean.Ts - 273.15)
-    else:
-        sst_c_unified = ts_c_unified
-    tmin = float(np.nanmin([ts_c_unified.min(), ta_c_unified.min(), sst_c_unified.min()]))
-    tmax = float(np.nanmax([ts_c_unified.max(), ta_c_unified.max(), sst_c_unified.max()]))
+    g_const = 9.81
+    # Temperature diagnostics
+    T_a = 288.0 + (g_const / 1004.0) * gcm.h
+    ta_c = T_a - 273.15
+    ts_c = np.nan_to_num(gcm.T_s - 273.15)
+    sst_c = np.nan_to_num((ocean.Ts if ocean is not None else gcm.T_s) - 273.15)
+    tmin = float(np.nanmin([ts_c.min(), ta_c.min(), sst_c.min()]))
+    tmax = float(np.nanmax([ts_c.max(), ta_c.max(), sst_c.max()]))
     t_levels = np.linspace(tmin, tmax, 20)
 
-    ts_plot = ax1.contourf(grid.lon, grid.lat, ts_c_unified, levels=t_levels, cmap='coolwarm')
-    ax1.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
-    ax1.set_title("Surface Temperature (°C)")
-    fig.colorbar(ts_plot, ax=ax1, label="°C")
+    # 1) Ts
+    ax = axes[0, 0]
+    cs = ax.contourf(grid.lon, grid.lat, ts_c, levels=t_levels, cmap="coolwarm")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Surface Temperature (°C)")
+    fig.colorbar(cs, ax=ax, label="°C")
 
-    # 2. Atmospheric Temperature (°C) – diagnostic from h（统一温度标尺）
-    ta_plot = ax2.contourf(grid.lon, grid.lat, ta_c_unified, levels=t_levels, cmap='coolwarm')
-    ax2.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
-    ax2.set_title("Atmospheric Temperature (°C)")
-    fig.colorbar(ta_plot, ax=ax2, label="°C")
+    # 2) Ta
+    ax = axes[0, 1]
+    cs = ax.contourf(grid.lon, grid.lat, ta_c, levels=t_levels, cmap="coolwarm")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Atmospheric Temperature (°C)")
+    fig.colorbar(cs, ax=ax, label="°C")
 
-    # 3. SST (°C)（统一温度标尺）
-    sst_plot_3 = ax3.contourf(grid.lon, grid.lat, sst_c_unified, levels=t_levels, cmap='coolwarm')
-    ax3.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=0.7)
-    ax3.set_title("SST (°C)")
-    fig.colorbar(sst_plot_3, ax=ax3, label="°C")
-    
-    # 4. Precipitation (1-day accumulation, mm/day)
-    precip_plot = ax4.contourf(grid.lon, grid.lat, precip, levels=np.linspace(0, 30, 11), cmap='Blues', extend='max')
-    ax4.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
-    ax4.set_title("Precipitation (1-day accumulation, mm/day)")
-    fig.colorbar(precip_plot, ax=ax4, label="mm/day")
+    # 3) Sea-level pressure (hPa) from shallow-water mass (diagnostic)
+    p0 = float(getattr(getattr(gcm, "hum_params", None), "p0", 1.0e5))
+    rho_air = float(getattr(getattr(gcm, "hum_params", None), "rho_a", 1.2))
+    ps = p0 + rho_air * g_const * (gcm.h - float(getattr(gcm, "H", 8000.0)))
+    ps_hpa = ps * 1e-2
+    ax = axes[0, 2]
+    cs = ax.contourf(grid.lon, grid.lat, ps_hpa, levels=20, cmap="viridis")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Sea-level Pressure (hPa, diag)")
+    fig.colorbar(cs, ax=ax, label="hPa")
 
-    # 5. Plot Wind Field (Streamline plot)（与洋流统一速度标尺）
+    # 4) SST
+    ax = axes[1, 0]
+    cs = ax.contourf(grid.lon, grid.lat, sst_c, levels=t_levels, cmap="coolwarm")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("SST (°C)")
+    fig.colorbar(cs, ax=ax, label="°C")
+
+    # 5) Precip (instantaneous, mm/day)
+    ax = axes[1, 1]
+    precip_mmday = np.nan_to_num(precip) * 86400.0  # kg m^-2 s^-1 → mm/day
+    cs = ax.contourf(grid.lon, grid.lat, precip_mmday, levels=np.linspace(0, 30, 11), cmap="Blues", extend="max")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Precipitation (instant, mm/day)")
+    fig.colorbar(cs, ax=ax, label="mm/day")
+
+    # 6) Cloud cover
+    ax = axes[1, 2]
+    cs = ax.contourf(grid.lon, grid.lat, cloud_cover, levels=np.linspace(0, 1, 11), cmap="Greys")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Cloud Cover Fraction")
+    fig.colorbar(cs, ax=ax, label="Fraction")
+
+    # 7) Wind field (streamlines)
+    ax = axes[2, 0]
     speed_w = np.sqrt(np.nan_to_num(gcm.u)**2 + np.nan_to_num(gcm.v)**2)
-    strm_w = ax5.streamplot(grid.lon, grid.lat, gcm.u, gcm.v, color=speed_w, cmap='viridis', density=1.5)
-    ax5.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
-    ax5.set_title("Wind Field (m/s)")
+    strm_w = ax.streamplot(grid.lon, grid.lat, gcm.u, gcm.v, color=speed_w, cmap="viridis", density=1.5)
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Wind Field (m/s)")
+    fig.colorbar(strm_w.lines, ax=ax, label="m/s")
 
-    # 6. Ocean surface currents (streamlines) if ocean enabled（与风场统一速度标尺）
-    if ocean is not None and ax6 is not None:
-        uo_plot = np.nan_to_num(ocean.uo)
-        vo_plot = np.nan_to_num(ocean.vo)
-        speed_o6 = np.sqrt(uo_plot**2 + vo_plot**2)
-        strm_o6 = ax6.streamplot(grid.lon, grid.lat, uo_plot, vo_plot, color=speed_o6, cmap='viridis', density=1.2)
-        # Unify color scale across wind (ax5) and ocean (ax6)
-        vmax_flow = float(np.nanmax([speed_w.max(), speed_o6.max()])) if np.isfinite(speed_o6).any() else float(speed_w.max())
-        strm_w.lines.set_clim(0.0, vmax_flow)
-        strm_o6.lines.set_clim(0.0, vmax_flow)
-        ax6.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=0.7)
-        ax6.set_title("Ocean Currents (streamlines, m/s)")
-        fig.colorbar(strm_o6.lines, ax=ax6, label="m/s")
+    # 8) Ocean currents or height anomaly
+    ax = axes[2, 1]
+    if ocean is not None:
+        uo = np.nan_to_num(ocean.uo); vo = np.nan_to_num(ocean.vo)
+        sp_o = np.sqrt(uo**2 + vo**2)
+        strm_o = ax.streamplot(grid.lon, grid.lat, uo, vo, color=sp_o, cmap="viridis", density=1.2)
+        ax.set_title("Ocean Currents (m/s)")
+        fig.colorbar(strm_o.lines, ax=ax, label="m/s")
     else:
-        # Fallback: Height if ocean disabled
-        h_plot6 = ax6.contourf(grid.lon, grid.lat, gcm.h, levels=20, cmap='RdBu_r')
-        ax6.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
-        ax6.set_title("Geopotential Height Anomaly (m)")
-        fig.colorbar(h_plot6, ax=ax6, label="m")
+        cs = ax.contourf(grid.lon, grid.lat, gcm.h - float(getattr(gcm, "H", 8000.0)), levels=20, cmap="RdBu_r")
+        ax.set_title("Geopotential Height Anomaly (m)")
+        fig.colorbar(cs, ax=ax, label="m")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
 
-    # 7. Incoming Shortwave Radiation (Total) with star centers overlaid
-    isr_plot = ax7.contourf(grid.lon, grid.lat, gcm.isr, levels=20, cmap='magma')
-    ax7.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='white', linewidths=0.5)
+    # 9) Vorticity (1/s)
+    ax = axes[2, 2]
+    vort = grid.vorticity(gcm.u, gcm.v)
+    vmax = np.nanmax(np.abs(vort))
+    levels = np.linspace(-vmax, vmax, 21) if np.isfinite(vmax) and vmax > 0 else 20
+    cs = ax.contourf(grid.lon, grid.lat, vort, levels=levels, cmap="PuOr")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Relative Vorticity (1/s)")
+    fig.colorbar(cs, ax=ax, label="1/s")
 
-    # Overlay star A/B subsolar points (maxima of each component)
+    # 10) Incoming Shortwave
+    ax = axes[3, 0]
+    cs = ax.contourf(grid.lon, grid.lat, gcm.isr, levels=20, cmap="magma")
     try:
         idxA = np.unravel_index(np.argmax(gcm.isr_A), gcm.isr_A.shape)
         idxB = np.unravel_index(np.argmax(gcm.isr_B), gcm.isr_B.shape)
         lonA, latA = grid.lon[idxA[1]], grid.lat[idxA[0]]
         lonB, latB = grid.lon[idxB[1]], grid.lat[idxB[0]]
-        ax7.scatter([lonA], [latA], c='cyan', s=30, marker='x', label='Star A center')
-        ax7.scatter([lonB], [latB], c='yellow', s=30, marker='+', label='Star B center')
-        ax7.legend(loc='upper right', fontsize=8)
+        ax.scatter([lonA], [latA], c="cyan", s=30, marker="x", label="Star A center")
+        ax.scatter([lonB], [latB], c="yellow", s=30, marker="+", label="Star B center")
+        ax.legend(loc="upper right", fontsize=8)
     except Exception:
         pass
+    ax.set_title("Incoming Shortwave (W/m²)")
+    fig.colorbar(cs, ax=ax, label="W/m²")
 
-    ax7.set_title("Incoming Shortwave (W/m^2, total)")
-    fig.colorbar(isr_plot, ax=ax7, label="W/m^2")
+    # 11) Dynamic Albedo
+    ax = axes[3, 1]
+    cs = ax.contourf(grid.lon, grid.lat, albedo, levels=np.linspace(0, 0.8, 17), cmap="cividis")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Dynamic Albedo")
+    fig.colorbar(cs, ax=ax, label="Albedo")
 
-    # 8. Plot Cloud Cover
-    cloud_plot = ax8.contourf(grid.lon, grid.lat, cloud_cover, levels=np.linspace(0, 1, 11), cmap='Greys')
-    ax8.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
-    ax8.set_title("Cloud Cover Fraction")
-    fig.colorbar(cloud_plot, ax=ax8, label="Fraction")
+    # 12) OLR
+    ax = axes[3, 2]
+    cs = ax.contourf(grid.lon, grid.lat, gcm.olr, levels=20, cmap="plasma")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="white", linewidths=0.5)
+    ax.set_title("Outgoing Longwave (W/m²)")
+    fig.colorbar(cs, ax=ax, label="W/m²")
 
-    # 9. Dynamic Albedo
-    albedo_plot2 = ax9.contourf(grid.lon, grid.lat, albedo, levels=np.linspace(0, 0.8, 11), cmap='cividis')
-    ax9.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=0.7)
-    ax9.set_title("Dynamic Albedo")
-    fig.colorbar(albedo_plot2, ax=ax9, label="Albedo")
+    # 13) Specific humidity q (g/kg)
+    ax = axes[4, 0]
+    if hasattr(gcm, "q"):
+        q_gkg = 1e3 * np.nan_to_num(gcm.q)
+        cs = ax.contourf(grid.lon, grid.lat, q_gkg, levels=20, cmap="GnBu")
+        ax.set_title("Specific Humidity q (g/kg)")
+        fig.colorbar(cs, ax=ax, label="g/kg")
+    else:
+        ax.text(0.5, 0.5, "q not enabled", ha="center", va="center")
+        ax.set_title("Specific Humidity q")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
 
-    # 10. Outgoing Longwave Radiation
-    olr_plot = ax10.contourf(grid.lon, grid.lat, gcm.olr, levels=20, cmap='plasma')
-    ax10.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='white', linewidths=0.5)
-    ax10.set_title("Outgoing Longwave (W/m^2)")
-    fig.colorbar(olr_plot, ax=ax10, label="W/m^2")
+    # 14) Evaporation E (mm/day)
+    ax = axes[4, 1]
+    E = getattr(gcm, "E_flux_last", 0.0)
+    if np.isscalar(E):
+        E = np.full_like(gcm.T_s, float(E))
+    E_mmday = np.nan_to_num(E) * 86400.0
+    cs = ax.contourf(grid.lon, grid.lat, E_mmday, levels=20, cmap="YlGn")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Evaporation (mm/day)")
+    fig.colorbar(cs, ax=ax, label="mm/day")
 
-    # Axes cosmetics
+    # 15) Condensation/Precip source P_cond (mm/day)
+    ax = axes[4, 2]
+    Pcond = getattr(gcm, "P_cond_flux_last", 0.0)
+    if np.isscalar(Pcond):
+        Pcond = np.full_like(gcm.T_s, float(Pcond))
+    Pcond_mmday = np.nan_to_num(Pcond) * 86400.0
+    cs = ax.contourf(grid.lon, grid.lat, Pcond_mmday, levels=20, cmap="BuPu")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.7)
+    ax.set_title("Condensation P_cond (mm/day)")
+    fig.colorbar(cs, ax=ax, label="mm/day")
+
+    # Cosmetics
     for ax in axes.flatten():
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
         ax.set_xlim(0, 360)
         ax.set_ylim(-90, 90)
 
-    # Save the figure
+    # Save
     filename = os.path.join(output_dir, f"state_day_{t_days:05.1f}.png")
-    plt.savefig(filename)
+    plt.savefig(filename, dpi=140)
     plt.close(fig)
 
 def plot_true_color(grid, gcm, land_mask, t_days, output_dir):
@@ -541,6 +591,12 @@ def main():
         )
         if i == 0:
             print(f"[CloudBlend] Weights: W_MEM={W_MEM:.2f}, W_P={W_P:.2f}, W_SRC={W_SRC:.2f}; P_ref={P_ref:.3e}, C_max={float(os.getenv('QD_CMAX', '0.95')):.2f}")
+        # Physical consistency: where it rains, clouds must be present (event-floor from precip)
+        C_floor = float(os.getenv("QD_CLOUD_FROM_P_FLOOR", "0.8"))  # 0..1
+        if C_floor > 0.0:
+            cloud_floor = np.clip(C_floor * C_from_P, 0.0, 1.0)
+            gcm.cloud_cover = np.maximum(gcm.cloud_cover, cloud_floor)
+
         gcm.cloud_cover = np.clip(gcm.cloud_cover, 0.0, 1.0)
 
         # 2) Radiative albedo using updated cloud cover
@@ -737,9 +793,8 @@ def main():
                 )
         
         if i % plot_interval_steps == 0:
-            # Use 1-day accumulated precipitation for plotting (kg m^-2 ≡ mm/day)
-            precip_for_plot = precip_day_last if precip_day_last is not None else precip_acc_day
-            plot_state(grid, gcm, land_mask, precip_for_plot, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean)
+            # Plot instantaneous precipitation rate (kg m^-2 s^-1 ⇒ mm/day)
+            plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean)
             plot_true_color(grid, gcm, land_mask, t_days, output_dir)
             # Diagnostics: per-star ISR components (disabled by default; enable with QD_PLOT_ISR=1)
             if PLOT_ISR:

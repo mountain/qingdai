@@ -4,6 +4,7 @@ physics.py
 This module contains parameterizations for physical processes in the Qingdai GCM,
 such as precipitation, cloud formation, and their feedback on radiation.
 """
+import os
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from . import constants
@@ -327,5 +328,27 @@ def diagnose_precipitation_hybrid(gcm,
     # 6) Gentle smoothing to avoid pixel/blocky artifacts
     if smooth_sigma and smooth_sigma > 0:
         P = gaussian_filter(P, sigma=float(smooth_sigma))
+
+    # 7) Optional fallback/blend to dynamic-convergence precipitation when humidity (P_cond) is too weak.
+    #    This ensures equatorial convergence (ITCZ-like) can still produce clouds/rain visually,
+    #    without altering the water-closure path (which uses P_cond in hydrology).
+    try:
+        use_fb = int(os.getenv("QD_P_HYBRID_FALLBACK", "1")) == 1
+        PQ_MIN = float(os.getenv("QD_PQ_MIN", "1e-8"))          # kg m^-2 s^-1 (~0.86 mm/day)
+        ALPHA_LEG = float(os.getenv("QD_P_BLEND", "0.6"))       # blend weight of legacy dyn-precip
+    except Exception:
+        use_fb = True
+        PQ_MIN = 1e-8
+        ALPHA_LEG = 0.6
+
+    if use_fb:
+        w = np.maximum(np.cos(np.deg2rad(grid.lat_mesh)), 0.0)
+        wsum = float(np.sum(w) + 1e-15)
+        Pq_mean = float(np.sum(Pq * w) / wsum)
+        if Pq_mean < PQ_MIN:
+            # Legacy dynamic precipitation purely from convergence (no cloud gating) for structure
+            P_dyn = diagnose_precipitation(gcm, grid, D_crit, k_precip, cloud_threshold=None, smooth_sigma=smooth_sigma)
+            # Blend fields to inject ITCZ-like signal when moisture supply is weak
+            P = (1.0 - ALPHA_LEG) * P + ALPHA_LEG * P_dyn
 
     return np.clip(P, 0.0, None)

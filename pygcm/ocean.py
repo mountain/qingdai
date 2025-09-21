@@ -342,11 +342,21 @@ class WindDrivenSlabOcean:
             use_qnet = int(os.getenv("QD_OCEAN_USE_QNET", "1")) == 1
             if use_qnet and (Q_net is not None):
                 heat_tendency = Q_net / (self.rho_w * self.cp_w * self.H)  # K/s
+                ocean_all = (self.land_mask == 0)
                 if ice_mask is not None:
-                    mask = (self.land_mask == 0) & (~ice_mask)
+                    open_mask = ocean_all & (~ice_mask)
+                    ice_mask_local = ocean_all & (ice_mask)
+                    # Allow reduced vertical exchange under ice rather than fully suppressing it,
+                    # otherwise polar SST may not cool realistically. Tunable via env:
+                    #   QD_OCEAN_ICE_QFAC in [0,1], default 0.2 (20% of open-ocean coupling).
+                    ice_qfac = float(os.getenv("QD_OCEAN_ICE_QFAC", "0.2"))
+                    Ts_new = self.Ts
+                    Ts_new = np.where(open_mask, Ts_new + sub_dt * heat_tendency, Ts_new)
+                    if ice_qfac > 0.0:
+                        Ts_new = np.where(ice_mask_local, Ts_new + sub_dt * ice_qfac * heat_tendency, Ts_new)
+                    self.Ts = Ts_new
                 else:
-                    mask = (self.land_mask == 0)
-                self.Ts = np.where(mask, self.Ts + sub_dt * heat_tendency, self.Ts)
+                    self.Ts = np.where(ocean_all, self.Ts + sub_dt * heat_tendency, self.Ts)
 
             # 8) Sanity caps per substep (outlier handling)
             self.uo = np.nan_to_num(self.uo)
@@ -385,6 +395,78 @@ class WindDrivenSlabOcean:
             _eta_cap = float(os.getenv("QD_ETA_CAP", "5.0"))
             self.eta = np.clip(self.eta, -_eta_cap, _eta_cap)
             self.Ts = np.nan_to_num(self.Ts)
+
+        # Ocean energy diagnostics (global and polar), compare implied d<Ts>/dt with effective Q_net
+        try:
+            if int(os.getenv("QD_OCEAN_ENERGY_DIAG", "1")) == 1:
+                every = int(os.getenv("QD_OCEAN_DIAG_EVERY", "200"))
+                if every <= 0:
+                    every = 200
+                if (self._step % every) == 0:
+                    # Area weights
+                    w = np.maximum(np.cos(self.lat_rad), 0.0)
+                    wsum_ocean = float(np.sum(w * (self.land_mask == 0)) + 1e-15)
+
+                    # Effective surface heat flux over ocean used this step (W/m^2):
+                    #   open ocean: Q_net
+                    #   under-ice:  ice_qfac * Q_net  (if ice mask provided)
+                    if Q_net is not None:
+                        if ice_mask is not None:
+                            ice_qfac = float(os.getenv("QD_OCEAN_ICE_QFAC", "0.2"))
+                            eff_Q = np.where((self.land_mask == 0) & (~ice_mask), Q_net, 0.0)
+                            if ice_qfac > 0.0:
+                                eff_Q += np.where((self.land_mask == 0) & (ice_mask), ice_qfac * Q_net, 0.0)
+                        else:
+                            eff_Q = np.where((self.land_mask == 0), Q_net, 0.0)
+                        Q_mean = float(np.sum(eff_Q * w) / wsum_ocean)
+                    else:
+                        Q_mean = 0.0
+
+                    # Implied net heat flux from prognosed Ts tendency over this outer step
+                    # (includes advection/diffusion/any caps): ρ c_p H d<Ts>/dt
+                    # For robustness, compare Ts at start-of-step vs end-of-step
+                    # Cache last Ts if available
+                    if not hasattr(self, "_Ts_prev_for_diag"):
+                        self._Ts_prev_for_diag = self.Ts.copy()
+                        implied = 0.0
+                        resid = 0.0
+                    else:
+                        dT = (self.Ts - self._Ts_prev_for_diag) / max(1e-12, dt)
+                        dT_mean = float(np.sum(dT * w * (self.land_mask == 0)) / wsum_ocean)
+                        implied = float(self.rho_w * self.cp_w * self.H * dT_mean)
+                        resid = implied - Q_mean
+                        self._Ts_prev_for_diag = self.Ts.copy()
+
+                    # Polar band diagnostics (|lat| >= 60°)
+                    lat_deg = np.abs(np.rad2deg(self.lat_rad))
+                    polar_mask = (lat_deg >= float(os.getenv("QD_OCEAN_POLAR_LAT", "60.0"))) & (self.land_mask == 0)
+                    if np.any(polar_mask):
+                        w_p = w * polar_mask
+                        wsum_p = float(np.sum(w_p) + 1e-15)
+                        if Q_net is not None:
+                            if ice_mask is not None:
+                                ice_qfac = float(os.getenv("QD_OCEAN_ICE_QFAC", "0.2"))
+                                eff_Qp = np.where(polar_mask & (~ice_mask), Q_net, 0.0)
+                                if ice_qfac > 0.0:
+                                    eff_Qp += np.where(polar_mask & (ice_mask), ice_qfac * Q_net, 0.0)
+                            else:
+                                eff_Qp = np.where(polar_mask, Q_net, 0.0)
+                            Qp_mean = float(np.sum(eff_Qp * w) / wsum_p)
+                        else:
+                            Qp_mean = 0.0
+                        dTp = (self.Ts - getattr(self, "_Ts_prev_for_diag_p", self.Ts)) / max(1e-12, dt)
+                        dTp_mean = float(np.sum(dTp * w * polar_mask) / wsum_p)
+                        implied_p = float(self.rho_w * self.cp_w * self.H * dTp_mean)
+                        resid_p = implied_p - Qp_mean
+                        self._Ts_prev_for_diag_p = self.Ts.copy()
+                    else:
+                        Qp_mean = implied_p = resid_p = 0.0
+
+                    print(f"[OceanE] ⟨Q_net⟩={Q_mean:+.2f} W/m^2 | implied={implied:+.2f} | resid={resid:+.2f}  "
+                          f"|| Polar(|lat|>={int(float(os.getenv('QD_OCEAN_POLAR_LAT','60')))}°): "
+                          f"⟨Q⟩={Qp_mean:+.2f}, implied={implied_p:+.2f}, resid={resid_p:+.2f}")
+        except Exception:
+            pass
 
         # Polar corrections at ±90°: average along longitude ring and refill
         if int(os.getenv("QD_OCEAN_POLAR_FIX", "1")) == 1:
