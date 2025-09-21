@@ -32,6 +32,27 @@
   ```
   输出包含 `[OceanDiag]`（KE、Umax、η统计、CFL）与 TrueColor 图；模型稳定完成短程自检。
 
+### 增补（2025-09-21 晚）：海–气耦合、可视化与稳定性更新
+
+- 海–气热交换（默认开启）：在 `ocean.step` 中启用 `Q_net/(ρ_w c_p,w H)` 垂直热通量（`QD_OCEAN_USE_QNET=1`），其中  
+  `Q_net = SW_sfc − LW_sfc − SH − LH` 来自 P006 能量模块。该通量直接更新海表温度（SST）。  
+- 海–气动量交换（相对风）：风应力改为使用相对风  
+  `τ = ρ_a C_D |V_a − U_o| (V_a − U_o)`，避免当海流接近大气风速时仍持续注入不合理动量。  
+  相关参数：`QD_CD`、`QD_TAU_SCALE`（默认 0.2）、`QD_WIND_STRESS_VCAP`（默认 15 m/s）。  
+- 可视化改进：  
+  - 状态图使用流线显示大气与洋流，并统一速度色标；三个温度面板（Ts, Ta, SST）统一色表与刻度。  
+  - 降水改为“行星日累计”（mm/day），便于与风场/地形对比。  
+- 数值稳定与物理保护：  
+  - 极区 sponge 阻尼（默认 |φ|≥70° 渐加强化）；极区度量保护（cosφ 下限）。  
+  - 海流异常点采用四邻域均值回填（`QD_OCEAN_OUTLIER=mean4`，默认），并保留轻微矢量限幅（`QD_OCEAN_MAX_U` 默认 3 m/s）。  
+  - 继续使用 ∇⁴ 选择性耗散与可选 Shapiro 滤波。  
+- 默认行为变更：动态海洋默认开启（`QD_USE_OCEAN=1`；显式设 0 可关闭）。  
+- 环境变量小结（新增/重要）：  
+  - `QD_OCEAN_USE_QNET`（1：启用海–气热交换；默认 1）  
+  - `QD_TAU_SCALE`（相对风应力效率，默认 0.2）、`QD_WIND_STRESS_VCAP`（应力风速上限，默认 15）  
+  - `QD_OCEAN_OUTLIER=mean4|clamp`（默认 mean4）  
+  - `QD_OCEAN_MAX_U`（海流矢量限幅，默认 3 m/s）
+
 ## 1. 目标
 - 在球面网格上实现单层风驱动浅水海洋（barotropic/shallow-water）：
   - 预报量：海洋速度 uo、vo 与海表高度 η

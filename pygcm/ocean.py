@@ -69,7 +69,9 @@ class WindDrivenSlabOcean:
 
         # CFL guard (diagnostic)
         self.cfl_target = float(os.getenv("QD_OCEAN_CFL", "0.5"))
-        self.max_u_cap = float(os.getenv("QD_OCEAN_MAX_U", "10.0"))  # sanity cap (ocean currents)
+        self.max_u_cap = float(os.getenv("QD_OCEAN_MAX_U", "3.0"))  # sanity cap (ocean currents, vector cap)
+        # Outlier handling for unrealistically fast currents: "mean4" (default) or "clamp"
+        self.outlier_method = os.getenv("QD_OCEAN_OUTLIER", "mean4").strip().lower()
 
         # Grid metrics
         self.a = const.PLANET_RADIUS
@@ -155,6 +157,74 @@ class WindDrivenSlabOcean:
         adv = map_coordinates(field, [dep_J, dep_I], order=1, mode="wrap", prefilter=False)
         return adv
 
+    # ----------------- Polar corrections (poles averaging) -----------------
+    def _polar_scalar_average_fill(self, F: np.ndarray, ocean_mask: np.ndarray) -> None:
+        """
+        Average scalar field F along the polar rings (lat = -90, +90) over ocean longitudes
+        and fill the entire polar ocean ring with that mean. Leave land points unchanged.
+        Operates in-place.
+        """
+        # South pole row (index 0)
+        j_s = 0
+        ocean_j = ocean_mask[j_s, :]
+        if np.any(ocean_j):
+            mean_s = float(np.mean(F[j_s, ocean_j]))
+            F[j_s, ocean_j] = mean_s
+
+        # North pole row (last index)
+        j_n = -1
+        ocean_j = ocean_mask[j_n, :]
+        if np.any(ocean_j):
+            mean_n = float(np.mean(F[j_n, ocean_j]))
+            F[j_n, ocean_j] = mean_n
+
+    def _polar_vector_average_fill(self, u: np.ndarray, v: np.ndarray, ocean_mask: np.ndarray) -> None:
+        """
+        For vector field (u: east, v: north), transform each polar-ring vector into a common
+        local tangent plane basis at the pole via 3D components, average, then transform back
+        to each longitude's local (east, north) and fill across ocean longitudes. Land left unchanged.
+        Operates in-place.
+        """
+        lons_rad = np.deg2rad(self.grid.lon)
+
+        def basis_vectors(lam: np.ndarray, pole: str) -> tuple[np.ndarray, np.ndarray]:
+            # East unit vector (independent of latitude)
+            e_east = np.stack([-np.sin(lam), np.cos(lam), np.zeros_like(lam)], axis=1)
+            if pole == "north":
+                # e_north at +90°: (-cosλ, -sinλ, 0)
+                e_north = np.stack([-np.cos(lam), -np.sin(lam), np.zeros_like(lam)], axis=1)
+            else:
+                # e_north at -90°: (cosλ, sinλ, 0)
+                e_north = np.stack([np.cos(lam), np.sin(lam), np.zeros_like(lam)], axis=1)
+            return e_east, e_north
+
+        # Helper to process one pole
+        def process_pole(j_idx: int, pole: str) -> None:
+            mask_row = ocean_mask[j_idx, :]
+            if not np.any(mask_row):
+                return
+            idx = np.where(mask_row)[0]
+            lam_sel = lons_rad[idx]
+            ee_sel, en_sel = basis_vectors(lam_sel, pole)
+            u_sel = u[j_idx, idx]
+            v_sel = v[j_idx, idx]
+            # Assemble 3D vectors on tangent plane
+            v3 = ee_sel * u_sel[:, None] + en_sel * v_sel[:, None]  # (N,3)
+            v3_mean = np.mean(v3, axis=0)  # (3,)
+
+            # Build basis for all longitudes to refill
+            ee_all, en_all = basis_vectors(lons_rad, pole)
+            u_fill = ee_all @ v3_mean
+            v_fill = en_all @ v3_mean
+
+            # Assign back only on ocean longitudes at this row
+            u[j_idx, mask_row] = u_fill[mask_row]
+            v[j_idx, mask_row] = v_fill[mask_row]
+
+        # South pole (index 0) and North pole (index -1)
+        process_pole(0, "south")
+        process_pole(-1, "north")
+
     # ----------------- Main step -----------------
     def step(self,
              dt: float,
@@ -175,10 +245,13 @@ class WindDrivenSlabOcean:
         self._step += 1
 
         # Precompute wind stress for this step (kept constant within substeps)
-        Va = np.sqrt(u_atm**2 + v_atm**2)
+        # Use relative wind (atmosphere minus surface current) for momentum exchange
+        u_rel = u_atm - self.uo
+        v_rel = v_atm - self.vo
+        Va = np.sqrt(u_rel**2 + v_rel**2)
         Va_eff = np.minimum(Va, self.vcap)
-        tau_x = self.tau_scale * (self.rho_a * self.CD * Va_eff * u_atm)
-        tau_y = self.tau_scale * (self.rho_a * self.CD * Va_eff * v_atm)
+        tau_x = self.tau_scale * (self.rho_a * self.CD * Va_eff * u_rel)
+        tau_y = self.tau_scale * (self.rho_a * self.CD * Va_eff * v_rel)
 
         # Determine stable substeps based on gravity wave and advective CFL
         dx_lat = self.a * self.dlat
@@ -265,8 +338,8 @@ class WindDrivenSlabOcean:
             if self.K_h > 0.0:
                 self.Ts += sub_dt * self.K_h * self._laplacian_sphere(self.Ts)
 
-            # 7) Optional vertical heat flux (disabled by default to avoid double counting)
-            use_qnet = int(os.getenv("QD_OCEAN_USE_QNET", "0")) == 1
+            # 7) Optional vertical heat flux (enabled by default for coupled exchange)
+            use_qnet = int(os.getenv("QD_OCEAN_USE_QNET", "1")) == 1
             if use_qnet and (Q_net is not None):
                 heat_tendency = Q_net / (self.rho_w * self.cp_w * self.H)  # K/s
                 if ice_mask is not None:
@@ -275,14 +348,55 @@ class WindDrivenSlabOcean:
                     mask = (self.land_mask == 0)
                 self.Ts = np.where(mask, self.Ts + sub_dt * heat_tendency, self.Ts)
 
-            # 8) Sanity caps per substep
-            self.uo = np.clip(np.nan_to_num(self.uo), -self.max_u_cap, self.max_u_cap)
-            self.vo = np.clip(np.nan_to_num(self.vo), -self.max_u_cap, self.max_u_cap)
+            # 8) Sanity caps per substep (outlier handling)
+            self.uo = np.nan_to_num(self.uo)
+            self.vo = np.nan_to_num(self.vo)
+            speed_vec = np.sqrt(self.uo**2 + self.vo**2)
+            cap = float(self.max_u_cap)
+
+            if self.outlier_method == "mean4":
+                # Replace outliers (> cap) with the mean of 4 neighbors (N,S,E,W).
+                u_n = np.roll(self.uo, -1, axis=0); u_s = np.roll(self.uo, 1, axis=0)
+                u_e = np.roll(self.uo, -1, axis=1); u_w = np.roll(self.uo, 1, axis=1)
+                v_n = np.roll(self.vo, -1, axis=0); v_s = np.roll(self.vo, 1, axis=0)
+                v_e = np.roll(self.vo, -1, axis=1); v_w = np.roll(self.vo, 1, axis=1)
+                u_mean4 = 0.25 * (u_n + u_s + u_e + u_w)
+                v_mean4 = 0.25 * (v_n + v_s + v_e + v_w)
+                mask_fast = speed_vec > cap
+                self.uo = np.where(mask_fast, u_mean4, self.uo)
+                self.vo = np.where(mask_fast, v_mean4, self.vo)
+                # Gentle safety clamp in case mean4 still exceeds cap slightly
+                speed_vec2 = np.sqrt(self.uo**2 + self.vo**2)
+                scale2 = np.where(speed_vec2 > cap, cap / (speed_vec2 + 1e-12), 1.0)
+                self.uo *= scale2
+                self.vo *= scale2
+            else:
+                # Fallback: vector clamp (previous behavior)
+                scale = np.where(speed_vec > cap, cap / (speed_vec + 1e-12), 1.0)
+                self.uo *= scale
+                self.vo *= scale
+
             self.eta = np.nan_to_num(self.eta)
             # Clamp eta to a safe anomaly range (meters) to prevent runaway
             _eta_cap = float(os.getenv("QD_ETA_CAP", "5.0"))
             self.eta = np.clip(self.eta, -_eta_cap, _eta_cap)
             self.Ts = np.nan_to_num(self.Ts)
+            # Clamp eta to a safe anomaly range (meters) to prevent runaway
+            _eta_cap = float(os.getenv("QD_ETA_CAP", "5.0"))
+            self.eta = np.clip(self.eta, -_eta_cap, _eta_cap)
+            self.Ts = np.nan_to_num(self.Ts)
+
+        # Polar corrections at ±90°: average along longitude ring and refill
+        if int(os.getenv("QD_OCEAN_POLAR_FIX", "1")) == 1:
+            ocean_mask = (self.land_mask == 0)
+            try:
+                # Scalars: SST
+                self._polar_scalar_average_fill(self.Ts, ocean_mask)
+                # Vectors: ocean currents (uo, vo)
+                self._polar_vector_average_fill(self.uo, self.vo, ocean_mask)
+            except Exception:
+                # Be fail-safe: skip polar correction on any unexpected numerical issue
+                pass
 
         # Final clamp on Ts to safe physical bounds
         ts_min = float(os.getenv("QD_TS_MIN", "150.0"))

@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 import numpy as np
+from typing import Optional, Tuple, Dict
 
 from . import constants as const
 
@@ -459,3 +460,44 @@ def compute_energy_diagnostics(lat_mesh: np.ndarray,
         "SH_mean": wmean(SH),
         "LH_mean": wmean(LH),
     }
+
+
+# ---------------- Greenhouse autotuning (diagnostic-driven) ----------------
+
+
+def autotune_greenhouse_params(params, diag, rate_eps=None, rate_kc=None,
+                               bounds_eps=(0.30, 0.98), bounds_kc=(0.0, 0.80),
+                               verbose=None):
+    """
+    Nudge greenhouse coefficients based on TOA_net to approach global energy balance.
+    Heuristic controller using the sign that dOLR/deps < 0 in gray one-layer model
+    (increasing eps reduces OLR if Ts^4 > Ta^4). Thus:
+      - If TOA_net > 0 (planet gaining energy), increase OLR -> decrease eps/kc.
+      - If TOA_net < 0, decrease OLR -> increase eps/kc.
+
+    Args:
+      params: EnergyParams instance (modified in place and also returned).
+      diag: dict from compute_energy_diagnostics (must contain "TOA_net" in W/m^2).
+      rate_eps: step size for lw_eps0 (default from env QD_TUNE_RATE_EPS or 5e-5 per step).
+      rate_kc: step size for lw_kc   (default from env QD_TUNE_RATE_KC  or 2e-5 per step).
+      bounds_eps/kc: clipping ranges to keep parameters in plausible intervals.
+      verbose: if True prints tuning line (default follows QD_ENERGY_AUTOTUNE_DIAG).
+
+    Returns:
+      params (same object) for convenience.
+    """
+    import numpy as _np
+    err = float(diag.get("TOA_net", 0.0))  # W/m^2; target 0
+    rate_eps = float(os.getenv("QD_TUNE_RATE_EPS", "5e-5")) if rate_eps is None else float(rate_eps)
+    rate_kc  = float(os.getenv("QD_TUNE_RATE_KC",  "2e-5")) if rate_kc  is None else float(rate_kc)
+    verbose = (int(os.getenv("QD_ENERGY_AUTOTUNE_DIAG", "1")) == 1) if verbose is None else bool(verbose)
+
+    # Controller: eps_new = eps_old - k * err
+    # Positive err (gain energy) -> decrease eps/kc to raise OLR
+    params.lw_eps0 = float(_np.clip(params.lw_eps0 - rate_eps * err, bounds_eps[0], bounds_eps[1]))
+    params.lw_kc   = float(_np.clip(params.lw_kc   - rate_kc  * err, bounds_kc[0], bounds_kc[1]))
+
+    if verbose:
+        print(f"[EnergyTune] TOA_net={err:+.3f} W/m^2 -> eps0={params.lw_eps0:.3f}, kc={params.lw_kc:.3f}")
+
+    return params

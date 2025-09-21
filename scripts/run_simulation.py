@@ -19,7 +19,7 @@ from pygcm.orbital import OrbitalSystem
 from pygcm.forcing import ThermalForcing
 from pygcm.dynamics import SpectralModel
 from pygcm.topography import create_land_sea_mask, generate_base_properties, load_topography_from_netcdf
-from pygcm.physics import diagnose_precipitation, parameterize_cloud_cover, calculate_dynamic_albedo, cloud_from_precip, compute_orographic_factor
+from pygcm.physics import diagnose_precipitation, diagnose_precipitation_hybrid, parameterize_cloud_cover, calculate_dynamic_albedo, cloud_from_precip, compute_orographic_factor
 from pygcm.hydrology import get_hydrology_params_from_env, partition_precip_phase, snow_step, update_land_bucket, diagnose_water_closure
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
@@ -60,7 +60,7 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
     fig.colorbar(ts_plot, ax=ax1, label="°C")
 
     # 2. Atmospheric Temperature (°C) – diagnostic from h（统一温度标尺）
-    ta_plot = ax2.contourf(grid.lon, grid.lat, ta_c_unified, levels=t_levels, cmap='inferno')
+    ta_plot = ax2.contourf(grid.lon, grid.lat, ta_c_unified, levels=t_levels, cmap='coolwarm')
     ax2.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
     ax2.set_title("Atmospheric Temperature (°C)")
     fig.colorbar(ta_plot, ax=ax2, label="°C")
@@ -71,11 +71,11 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
     ax3.set_title("SST (°C)")
     fig.colorbar(sst_plot_3, ax=ax3, label="°C")
     
-    # 4. Plot Precipitation
-    precip_plot = ax4.contourf(grid.lon, grid.lat, precip * 1e5, levels=np.linspace(0.1, 5, 10), cmap='Blues', extend='max')
+    # 4. Precipitation (1-day accumulation, mm/day)
+    precip_plot = ax4.contourf(grid.lon, grid.lat, precip, levels=np.linspace(0, 30, 11), cmap='Blues', extend='max')
     ax4.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors='black', linewidths=1)
-    ax4.set_title("Precipitation Rate (arbitrary units)")
-    fig.colorbar(precip_plot, ax=ax4, label="Rate")
+    ax4.set_title("Precipitation (1-day accumulation, mm/day)")
+    fig.colorbar(precip_plot, ax=ax4, label="mm/day")
 
     # 5. Plot Wind Field (Streamline plot)（与洋流统一速度标尺）
     speed_w = np.sqrt(np.nan_to_num(gcm.u)**2 + np.nan_to_num(gcm.v)**2)
@@ -386,6 +386,12 @@ def main():
     print("Initializing thermal forcing...")
     forcing = ThermalForcing(grid, orbital_sys)
 
+    # Initialize energy parameters and optional greenhouse autotuning
+    print("Initializing energy parameters...")
+    eparams = energy.get_energy_params_from_env()
+    AUTOTUNE = int(os.getenv("QD_ENERGY_AUTOTUNE", "0")) == 1
+    TUNE_EVERY = int(os.getenv("QD_ENERGY_TUNE_EVERY", "50"))
+
     print("Initializing dynamics core with surface friction and greenhouse effect...")
     gcm = SpectralModel(
         grid, friction_map, H=8000, tau_rad=10 * 24 * 3600, greenhouse_factor=0.3,
@@ -455,6 +461,11 @@ def main():
     print(f"Simulation duration: {sim_duration_seconds / day_in_seconds:.1f} planetary days")
     print(f"Total time steps: {len(time_steps)}")
 
+    # --- Precipitation accumulation over one planetary day (kg m^-2 ≡ mm/day) ---
+    precip_acc_day = np.zeros_like(grid.lat_mesh, dtype=float)
+    accum_t_day = 0.0
+    precip_day_last = None
+
     # 2. Time Integration Loop
     try:
         from tqdm import tqdm
@@ -465,16 +476,29 @@ def main():
 
     for i, t in enumerate(iterator):
         # 1. Physics Step
-        # 1) Diagnose precipitation from dynamics WITHOUT cloud gating (avoid circularity)
-        precip = diagnose_precipitation(gcm, grid, D_crit, k_precip, cloud_threshold=None)
-        # Optional orographic enhancement (uses upslope wind and elevation)
+        # 1) Humidity-aware precipitation（混合方案，使用 P_cond + 动力再分配 + 可选地形强化）
+        #    先计算地形增强因子（若有外部 elevation）
+        orog_factor = None
         if OROG_ENABLED and (elevation is not None):
             try:
-                factor = compute_orographic_factor(grid, elevation, gcm.u, gcm.v, k_orog=K_OROG)
-                precip = precip * factor
+                orog_factor = compute_orographic_factor(grid, elevation, gcm.u, gcm.v, k_orog=K_OROG)
             except Exception as e:
                 if i == 0:
                     print(f"[Orog] Disabled due to error: {e}")
+        #    使用湿度模块的 P_cond（若存在）作为总量基准；用辐合和地形做空间再分配；全局重标定保持 ⟨P⟩=⟨P_cond⟩
+        beta_div = float(os.getenv("QD_P_BETADIV", "0.4"))
+        precip = diagnose_precipitation_hybrid(
+            gcm, grid, D_crit=D_crit, k_precip=k_precip,
+            orog_factor=orog_factor, smooth_sigma=1.0, beta_div=beta_div, renorm=True
+        )
+
+        # Accumulate precipitation over one planetary day (kg m^-2 over last day window)
+        precip_acc_day += np.nan_to_num(precip) * dt
+        accum_t_day += dt
+        while accum_t_day >= day_in_seconds:
+            precip_day_last = precip_acc_day.copy()
+            precip_acc_day[:] = 0.0
+            accum_t_day -= day_in_seconds
         
         # 1b) Convert precipitation to cloud fraction via smooth saturating relation
         if np.any(precip > 0):
@@ -553,8 +577,8 @@ def main():
                 ice_mask = (getattr(gcm, "h_ice", np.zeros_like(gcm.T_s)) > 0.0)
                 # Cloud optical field for radiation consistency if available
                 cloud_eff = getattr(gcm, "cloud_eff_last", gcm.cloud_cover)
-                # Energy params for radiation calculation
-                eparams = energy.get_energy_params_from_env()
+                # Energy params for radiation calculation (persistent; may be auto-tuned)
+                # eparams is initialized once before the loop and optionally auto-tuned
                 # Shortwave components at surface (use same albedo as current step)
                 SW_atm, SW_sfc, _R = energy.shortwave_radiation(gcm.isr, albedo, cloud_eff, eparams)
                 # Atmospheric temperature proxy (consistent with dynamics core simplification)
@@ -589,6 +613,13 @@ def main():
                     LH_arr = np.full_like(gcm.T_s, float(LH_arr))
                 # Net heat into surface (W/m^2)
                 Q_net = SW_sfc - LW_sfc - SH_arr - LH_arr
+
+                # Optional greenhouse autotuning using global energy diagnostics
+                if AUTOTUNE and (i % TUNE_EVERY == 0):
+                    diagE = energy.compute_energy_diagnostics(
+                        grid.lat_mesh, gcm.isr, _R, _OLR, SW_sfc, LW_sfc, SH_arr, LH_arr
+                    )
+                    eparams = energy.autotune_greenhouse_params(eparams, diagE)
 
                 # Advance ocean
                 ocean.step(dt, gcm.u, gcm.v, Q_net=Q_net, ice_mask=ice_mask)
@@ -706,7 +737,9 @@ def main():
                 )
         
         if i % plot_interval_steps == 0:
-            plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean)
+            # Use 1-day accumulated precipitation for plotting (kg m^-2 ≡ mm/day)
+            precip_for_plot = precip_day_last if precip_day_last is not None else precip_acc_day
+            plot_state(grid, gcm, land_mask, precip_for_plot, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean)
             plot_true_color(grid, gcm, land_mask, t_days, output_dir)
             # Diagnostics: per-star ISR components (disabled by default; enable with QD_PLOT_ISR=1)
             if PLOT_ISR:

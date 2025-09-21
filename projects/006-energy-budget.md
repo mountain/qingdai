@@ -34,6 +34,20 @@
   ```
 - 后续里程碑：M4 能量闭合诊断（TOA/SFC/ATM）与长期守恒验证；M5 参数标定与默认参数组。
 
+### 实现状态更新（2025-09-21）
+- 新增：温室系数自动微调（Autotune）与持久参数
+  - 在 `pygcm/energy.py` 增加 `autotune_greenhouse_params(params, diag)`，基于全局能量诊断 `TOA_net` 对长波系数作温和校正：
+    - 若 `TOA_net > 0`（行星增能），略减小 `lw_eps0/lw_kc` 以提升 OLR；
+    - 若 `TOA_net < 0`（行星失能），略增大 `lw_eps0/lw_kc` 以降低 OLR。
+  - 步长（可配）：`QD_TUNE_RATE_EPS`（默认 5e-5）、`QD_TUNE_RATE_KC`（默认 2e-5）；范围约束：`lw_eps0∈[0.30,0.98]`、`lw_kc∈[0.0,0.80]`。
+  - 在 `scripts/run_simulation.py` 中按 `QD_ENERGY_TUNE_EVERY`（默认 50 步）调用，开关 `QD_ENERGY_AUTOTUNE=1` 开启；能量参数 `eparams` 启动时加载并在运行期持续持有与微调。
+- 与 P011（海洋）耦合更新（见 P011 文档）：
+  - 海–气热交换：`Q_net = SW_sfc − LW_sfc − SH − LH` 默认作为海表垂直通量（`QD_OCEAN_USE_QNET=1`）进入海洋混合层能量；
+  - 海–气动量交换：风应力使用相对风 `|V_a − U_o| (V_a − U_o)` 形式，避免对随风同向的强海流过度加速。
+- 可视化/诊断：
+  - 状态图新增“行星日累计降水”（mm/day）；温度面板（Ts/Ta/SST）统一色表与刻度；风/洋流流线统一速度色标；
+  - 维持 `compute_energy_diagnostics` 打印 TOA/SFC/ATM 收支以观察向平衡收敛趋势。
+
 ## 1. 背景与目标
 
 - 背景：当前 GCM 使用牛顿冷却（T 向 Teq 弛豫）近似，虽稳定高效，但将辐射-地表-云-大气的能量交换黑箱化，难以扩展与诊断。

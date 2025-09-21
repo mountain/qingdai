@@ -247,3 +247,85 @@ def calculate_dynamic_albedo(cloud_cover,
     # Mix with cloud albedo
     albedo = surface_albedo * (1.0 - C) + float(alpha_cloud) * C
     return np.clip(albedo, 0.0, 1.0)
+
+
+def diagnose_precipitation_hybrid(gcm,
+                                  grid,
+                                  D_crit: float = -1e-7,
+                                  k_precip: float = 1.0,
+                                  *,
+                                  orog_factor: np.ndarray | None = None,
+                                  smooth_sigma: float = 1.0,
+                                  beta_div: float = 0.4,
+                                  renorm: bool = True):
+    """
+    Humidity-aware precipitation diagnosis (hybrid):
+      - Base magnitude from humidity module's condensation P_cond (kg m^-2 s^-1)
+      - Spatial redistribution by dynamic convergence and optional orographic factor
+      - Optional global renormalization to conserve the total P (= total P_cond)
+
+    Rationale:
+      - With q available (P008), P_cond provides physically consistent column condensation.
+      - Convergence / upslope provides spatial structure without creating mass from nothing.
+      - Renorm keeps ⟨P⟩ consistent with humidity/energy closure (LH_release).
+
+    Args:
+        gcm: model state (expects attribute `P_cond_flux_last` from humidity module).
+        grid: SphericalGrid for divergence/area weights.
+        D_crit: critical convergence (s^-1) to start enhancement.
+        k_precip: kept for API compatibility (not used directly; scaling is driven by P_cond).
+        orog_factor: multiplicative enhancement factor (>=1) from `compute_orographic_factor`.
+        smooth_sigma: Gaussian sigma (grid points) to smooth the final field.
+        beta_div: weight of dynamic convergence redistribution (0..1 typical 0.3–0.6).
+        renorm: if True, rescale to keep global area-weighted ⟨P⟩ equal to ⟨P_cond⟩.
+
+    Returns:
+        precip (np.ndarray): precipitation rate (kg m^-2 s^-1), same shape as grid.
+    """
+    # 1) Base field from humidity condensation (fallback to old diagnostic if missing)
+    P_cond = getattr(gcm, "P_cond_flux_last", None)
+    if P_cond is None:
+        # Fallback: use legacy convergence-based diagnostic (no cloud gating here)
+        return diagnose_precipitation(gcm, grid, D_crit, k_precip, cloud_threshold=None, smooth_sigma=smooth_sigma)
+
+    Pq = np.maximum(0.0, np.asarray(P_cond, dtype=float))
+
+    # 2) Dynamic convergence redistribution factor (normalized)
+    div = grid.divergence(gcm.u, gcm.v)
+    pos = np.maximum(0.0, -(div - float(D_crit)))  # positive where convergence exceeds threshold
+    # Normalize by a robust scale (median of positives) and cap to avoid spikes
+    if np.any(pos > 0):
+        ppos = pos[pos > 0]
+        scale = float(np.median(ppos))
+        scale = max(scale, 1e-12)
+        F_div = np.clip(pos / scale, 0.0, 5.0)  # cap at 5 for stability
+    else:
+        F_div = np.zeros_like(Pq)
+
+    # 3) Orographic factor (>=1), optional
+    if orog_factor is None:
+        F_orog = 1.0
+    else:
+        F_orog = np.clip(np.asarray(orog_factor, dtype=float), 1.0, 3.0)
+
+    # 4) Compose multiplicative redistribution factor
+    F = (1.0 + float(beta_div) * F_div) * F_orog
+
+    # 5) Apply and optionally renormalize to conserve total precipitation
+    P_raw = Pq * F
+
+    if renorm:
+        # Area-weighted global mean conservation
+        w = np.maximum(np.cos(np.deg2rad(grid.lat_mesh)), 0.0)
+        num = float(np.sum(Pq * w))
+        den = float(np.sum(P_raw * w)) + 1e-20
+        s = num / den if den > 0 else 1.0
+        P = P_raw * s
+    else:
+        P = P_raw
+
+    # 6) Gentle smoothing to avoid pixel/blocky artifacts
+    if smooth_sigma and smooth_sigma > 0:
+        P = gaussian_filter(P, sigma=float(smooth_sigma))
+
+    return np.clip(P, 0.0, None)
