@@ -2,7 +2,7 @@
 
 本文梳理当前实现所涉及的运行时环境变量（env），覆盖气候模型的主要子系统，并给出推荐的使用场景与调参指导。所有变量均可在运行前通过环境变量导出，或在脚本中设置（例如 `spin-up.sh` 已提供常用组合）。
 
-- 适用版本：本仓库当前实现（含 P004–P013 以及最近动力学/可视化修订）
+- 适用版本：本仓库当前实现（含 P004–P014 以及最近动力学/可视化修订）
 - 单位：若未特别说明，SI 制；角度单位见各条目
 
 目录：
@@ -15,6 +15,7 @@
 7) 动力学反噪与滤波（P010）  
 8) 可视化与诊断（绘图/日志）  
 9) 自旋与重启（P013）
+10) 路由与湖泊（P014）
 
 ---
 
@@ -193,6 +194,14 @@ Shapiro 与谱带阻：
 
 ---
 
+## 10) 路由与湖泊（P014）
+
+- QD_HYDRO_NETCDF（默认 data/hydrology_network.nc）：离线路由网络（flow_to_index/flow_order/lake_*）NetCDF  
+- QD_HYDRO_DT_HOURS（默认 6）：水文步长（小时），达到该累计时长时执行一次全图路由/湖泊水量更新  
+- QD_TREAT_LAKE_AS_WATER（默认 1）：湖面在能量/湿度路径上按水体（海洋）处理  
+- QD_ALPHA_LAKE（可选）：覆盖湖面基础反照率（不设则与海洋相同）  
+- QD_HYDRO_DIAG（默认 1）：打印路由诊断（入海通量、最大流量、质量闭合误差等）  
+
 # 推荐配置与使用指引
 
 场景 A：稳定默认（快速体验/出图）
@@ -238,6 +247,6 @@ Shapiro 与谱带阻：
 
 - P004/005/006/007/008/009/010/011/012/013 项目文档  
 - 脚本：`scripts/run_simulation.py`、`spin-up.sh`  
-- 主要模块：`pygcm/dynamics.py`、`pygcm/energy.py`、`pygcm/humidity.py`、`pygcm/hydrology.py`、`pygcm/ocean.py`、`pygcm/topography.py`
+- 主要模块：`pygcm/dynamics.py`、`pygcm/energy.py`、`pygcm/humidity.py`、`pygcm/hydrology.py`、`pygcm/ocean.py`、`pygcm/topography.py`、`pygcm/routing.py`
 
 如需把本目录集成到 README 的“运行 GCM”小节，可在后续提交中将该文档链接加入目录列表。

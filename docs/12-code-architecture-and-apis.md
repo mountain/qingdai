@@ -5,7 +5,7 @@
 关联文档
 - docs/01–03：天文设定、轨道与气候框架
 - docs/04：运行配置与环境变量目录
-- docs/05–11：地形/反照率、能量、海洋/海冰、湿度/云、水文闭合、数值稳定、Spin-up
+- docs/05–11：地形/反照率、能量、海洋/海冰、湿度/云、水文闭合、数值稳定、Spin-up；P014：地表路由与湖泊
 
 
 ## 12.1 包结构与职责
@@ -24,17 +24,19 @@ pygcm/
   ├── topography.py     # 地形 I/O（NetCDF）、插值与 base_albedo/friction 生成
   ├── humidity.py       # q 场、蒸发 E、饱和与凝结、潜热释放
   ├── hydrology.py      # 水库/相态/陆地桶/径流/闭合诊断
+  ├── routing.py        # 地表水文路由（P014）：河网/湖泊、异步汇流
   └── ocean.py          # 风驱动浅水海洋与 SST 平流、极点处理/稳定化
 scripts/
   ├── run_simulation.py     # 主仿真入口（读取 env、初始化模块、主循环）
   ├── generate_topography.py # P004 地形生成
   ├── plot_topography.py     # 地形与属性可视化
   ├── diag_isr.py            # 双星短波分量诊断
-  └── generate_orbit_plots.py|test_orbital_module.py|verify_calculation.py
+  ├── generate_orbit_plots.py|test_orbital_module.py|verify_calculation.py
+  └── generate_hydrology_maps.py  # P014 离线预计算（Pit Filling/流向/湖泊识别）
 ```
 
 设计总览
-- “核心环路”按 docs/06/07/08/09/10 的顺序协调：轨道几何/辐射 → 动力步 → 湿度步 → 能量步（地表/大气）→ 海洋步（若先平流再能量亦可）→ 水文闭合 → 诊断/出图
+- “核心环路”按 docs/06/07/08/09/10 的顺序协调：轨道几何/辐射 → 动力步 → 湿度步 → 能量步（地表/大气）→ 海洋步（若先平流再能量亦可）→ 水文闭合（P009）→（到达水文步长时）地表路由/湖泊（P014）→ 诊断/出图
 - “数值稳定”在 dynamics/ocean 内通过 ∇⁴/滤波实现，参数集中由环境变量控制（详见 docs/10）
 - 跨模块公共度量（如行星半径、自转、天文常量）集中在 constants.py
 
@@ -104,6 +106,12 @@ ocean.py
   - step(dt, u_atm, v_atm, Q_net, ice_mask=None) → updates uo, vo, η, Ts
   - diagnostics() → {KE, umax, η_stats, CFL, …}
   - 内部：相对风应力、底摩擦、∇⁴/滤波、极点一致化、极区 sponge、SST 平流与热通量注入
+
+routing.py
+- class RiverRouting(grid, network_nc_path, dt_hydro_hours=6.0, …)
+  - step(R_land_flux, dt_seconds, precip_flux=None, evap_flux=None) → 异步累计并在水文步长时执行汇流/湖泊更新
+  - diagnostics() → {flow_accum_kgps, lake_volume_kg|map, ocean_inflow_kgps, mass_closure_error_kg}
+  - 数据：flow_to_index/flow_order/lake_mask/lake_id 等由 data/hydrology_network.nc 提供（见 P014）
 
 dynamics.py
 - class SpectralModel/Model(grid, friction_map, params, …)
