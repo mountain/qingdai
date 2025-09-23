@@ -107,11 +107,24 @@ class WindDrivenSlabOcean:
         term_lam = d2F_dlam2 / (self.coslat ** 2)
         return (term_phi + term_lam) / (self.a ** 2)
 
-    def _hyperdiffuse(self, F: np.ndarray, dt: float, k4: float, n_substeps: int = 1) -> np.ndarray:
+    def _hyperdiffuse(self, F: np.ndarray, dt: float, k4, n_substeps: int = 1) -> np.ndarray:
         """
         Explicit ∇⁴ hyperdiffusion with optional substeps for stability.
+        k4 can be a scalar (float) or a 2D map broadcastable to F.
         """
-        if k4 <= 0.0 or dt <= 0.0:
+        if dt <= 0.0:
+            return F
+        # Build k4 array or scalar
+        try:
+            if np.isscalar(k4):
+                k4_arr = float(k4)
+                if k4_arr <= 0.0:
+                    return F
+            else:
+                k4_arr = np.nan_to_num(k4, copy=False)
+                if np.all(k4_arr <= 0.0):
+                    return F
+        except Exception:
             return F
         n = max(1, int(n_substeps))
         sub_dt = dt / n
@@ -119,8 +132,8 @@ class WindDrivenSlabOcean:
         for _ in range(n):
             L = self._laplacian_sphere(out)
             L2 = self._laplacian_sphere(L)
-            out = out - k4 * L2 * sub_dt
-        return out
+            out = out - k4_arr * L2 * sub_dt
+        return np.nan_to_num(out, copy=False)
 
     def _shapiro_filter(self, F: np.ndarray, n: int = 2) -> np.ndarray:
         """
@@ -303,10 +316,21 @@ class WindDrivenSlabOcean:
 
             # 4) Scale-selective dissipation (cadence tied to outer step)
             if (self.diff_every > 0) and (self._step % self.diff_every == 0):
-                k4_base = self.sigma4 * (dx_min**4) / max(1e-12, sub_dt)
-                self.uo = self._hyperdiffuse(self.uo, sub_dt, k4_base, n_substeps=self.k4_nsub)
-                self.vo = self._hyperdiffuse(self.vo, sub_dt, k4_base, n_substeps=self.k4_nsub)
-                self.eta = self._hyperdiffuse(self.eta, sub_dt, 0.5 * k4_base, n_substeps=self.k4_nsub)
+                # Latitude-adaptive K4 map so that (K4*dt/Δx(φ)^4) ≈ sigma4
+                cos_map = self.coslat
+                dx_lat = self.a * self.dlat                          # scalar
+                dx_lon_map = self.a * self.dlon * cos_map            # 2D map
+                dx_min_map = np.minimum(dx_lat, dx_lon_map)
+                k4_map = self.sigma4 * (dx_min_map**4) / max(1e-12, sub_dt)
+
+                # Allow optional scalar overrides via env; otherwise use maps
+                k4_u = float(os.getenv("QD_OCEAN_K4_U")) if ("QD_OCEAN_K4_U" in os.environ) else k4_map
+                k4_v = float(os.getenv("QD_OCEAN_K4_V")) if ("QD_OCEAN_K4_V" in os.environ) else k4_map
+                k4_eta = float(os.getenv("QD_OCEAN_K4_ETA")) if ("QD_OCEAN_K4_ETA" in os.environ) else (0.5 * k4_map)
+
+                self.uo = self._hyperdiffuse(self.uo, sub_dt, k4_u, n_substeps=self.k4_nsub)
+                self.vo = self._hyperdiffuse(self.vo, sub_dt, k4_v, n_substeps=self.k4_nsub)
+                self.eta = self._hyperdiffuse(self.eta, sub_dt, k4_eta, n_substeps=self.k4_nsub)
 
             # Optional Shapiro smoothing (off by default)
             if (self.shapiro_n > 0) and (self.shapiro_every > 0) and (self._step % self.shapiro_every == 0):

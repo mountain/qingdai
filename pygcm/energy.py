@@ -124,9 +124,9 @@ def longwave_radiation(Ts: np.ndarray, Ta: np.ndarray, cloud: np.ndarray, params
         gh_lock = True
     if gh_lock:
         try:
-            g_target = float(os.getenv("QD_GH_FACTOR", "0.05"))
+            g_target = float(os.getenv("QD_GH_FACTOR", "0.00"))
         except Exception:
-            g_target = 0.05
+            g_target = 0.00
         Ts4_raw = np.maximum(0.0, Ts) ** 4
         OLR_target = (1.0 - g_target) * sigma * Ts4_raw
         DLR_target = g_target * sigma * Ts4_raw
@@ -221,9 +221,9 @@ def longwave_radiation_v2(Ts: np.ndarray,
         gh_lock = True
     if gh_lock:
         try:
-            g_target = float(os.getenv("QD_GH_FACTOR", "0.05"))
+            g_target = float(os.getenv("QD_GH_FACTOR", "0.00"))
         except Exception:
-            g_target = 0.05
+            g_target = 0.00
         Ts4_raw = np.maximum(0.0, Ts) ** 4
         OLR_target = (1.0 - g_target) * sigma * Ts4_raw
         DLR_target = g_target * sigma * Ts4_raw
@@ -373,6 +373,44 @@ def integrate_surface_energy_with_seaice(Ts: np.ndarray,
 
     # Apply residual energy to temperature
     Ts_next = Ts_next + (Q_net / Cs_eff) * dt
+
+    # South/North-pole hard constraint to suppress polar artifact on regular lat-lon grids:
+    # If at the polar ring an ocean point is net-cooling (Q_net<0) but Ts remains above freezing,
+    # force Ts to the freezing point. This mitigates numerical warm-pole amplification by ring-averaging.
+    try:
+        _fix_s = int(os.getenv("QD_POLAR_FREEZE_FIX", "1")) == 1
+    except Exception:
+        _fix_s = True
+    try:
+        _fix_n = int(os.getenv("QD_POLAR_FREEZE_FIX_N", "1")) == 1
+    except Exception:
+        _fix_n = True
+    # South pole (row 0)
+    if _fix_s:
+        try:
+            _j = 0
+            _ocean = ocean[_j, :]
+            _cool = Q_net[_j, :] < 0.0
+            _above = Ts_next[_j, :] > t_freeze
+            _mask = _ocean & _cool & _above
+            if np.any(_mask):
+                Ts_next[_j, _mask] = t_freeze
+        except Exception:
+            # Fail-safe: never crash the timestep on fix failure
+            pass
+    # North pole (last row)
+    if _fix_n:
+        try:
+            _j = -1
+            _ocean = ocean[_j, :]
+            _cool = Q_net[_j, :] < 0.0
+            _above = Ts_next[_j, :] > t_freeze
+            _mask = _ocean & _cool & _above
+            if np.any(_mask):
+                Ts_next[_j, _mask] = t_freeze
+        except Exception:
+            # Fail-safe: never crash the timestep on fix failure
+            pass
 
     # Clamp: ice surface not exceeding freezing; global temperature floor
     Ts_next = np.where((h_ice_next > 0.0) & ocean, np.minimum(Ts_next, t_freeze), Ts_next)

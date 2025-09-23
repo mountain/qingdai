@@ -163,25 +163,35 @@ class SpectralModel:
 
         return (term_phi + term_lmb) / (a ** 2)
 
-    def _hyperdiffuse(self, F: np.ndarray, k4: float, dt: float, n_substeps: int = 1) -> np.ndarray:
+    def _hyperdiffuse(self, F: np.ndarray, k4, dt: float, n_substeps: int = 1) -> np.ndarray:
         """
         Apply explicit 4th-order hyperdiffusion: dF/dt = -k4 * ∇⁴ F
+        k4 can be a scalar (float) or a 2D map broadcastable to F.
         Implemented as two successive Laplacians. Optionally uses substeps for stability margin.
         """
-        try:
-            k4 = float(k4)
-        except Exception:
+        if dt <= 0.0:
             return F
-        if k4 <= 0.0 or dt <= 0.0:
+        # Build k4 array
+        try:
+            import numpy as _np
+            if _np.isscalar(k4):
+                k4_arr = float(k4)
+                if k4_arr <= 0.0:
+                    return F
+            else:
+                k4_arr = _np.nan_to_num(k4, copy=False)
+                if _np.all(k4_arr <= 0.0):
+                    return F
+        except Exception:
             return F
         n = max(1, int(n_substeps))
         sub_dt = dt / n
-        out = F
+        out = _np.nan_to_num(F, copy=True)
         for _ in range(n):
             L = self._laplacian_sphere(out)
             L2 = self._laplacian_sphere(L)
-            out = out - k4 * L2 * sub_dt
-        return out
+            out = out - k4_arr * L2 * sub_dt
+        return _np.nan_to_num(out, copy=False)
 
     # ---------------- Project 010 M4: Alternate filters (Shapiro / Spectral) ----------------
     def _shapiro_filter(self, F: np.ndarray, n: int = 2, lon_wrap: bool = True) -> np.ndarray:
@@ -526,18 +536,22 @@ class SpectralModel:
                     sigma4 = float(sigma4_env)
                 except Exception:
                     sigma4 = 0.02
-                # Metric lengths (most conservative)
-                dx_lat = self.a * self.dlat_rad
-                min_cos = float(max(1e-3, np.cos(np.deg2rad(self.grid.lat)).min()))
-                dx_lon_min = self.a * self.dlon_rad * min_cos
-                dx_min = min(dx_lat, dx_lon_min)
-                k4_base = sigma4 * (dx_min ** 4) / max(1e-12, dt)
-                k4_u = float(os.getenv("QD_K4_U", k4_base))
-                k4_v = float(os.getenv("QD_K4_V", k4_base))
-                k4_h = float(os.getenv("QD_K4_H", 0.5 * k4_base))
-                k4_q = float(os.getenv("QD_K4_Q", 0.5 * k4_base))
-                k4_c = float(os.getenv("QD_K4_CLOUD", 0.25 * k4_base))
+                # Latitude-adaptive metric lengths per grid point
+                phi = np.deg2rad(self.grid.lat_mesh)
+                cos = np.maximum(np.cos(phi), 1e-3)
+                dx_lat = self.a * self.dlat_rad                             # scalar
+                dx_lon_map = self.a * self.dlon_rad * cos                   # 2D map
+                dx_min_map = np.minimum(dx_lat, dx_lon_map)                 # 2D map
+                k4_map_base = sigma4 * (dx_min_map ** 4) / max(1e-12, dt)  # 2D map
+
+                # If explicit overrides are provided in env, use them (scalars). Otherwise use maps.
+                k4_u = float(os.getenv("QD_K4_U")) if ("QD_K4_U" in os.environ) else k4_map_base
+                k4_v = float(os.getenv("QD_K4_V")) if ("QD_K4_V" in os.environ) else k4_map_base
+                k4_h = float(os.getenv("QD_K4_H")) if ("QD_K4_H" in os.environ) else (0.5 * k4_map_base)
+                k4_q = float(os.getenv("QD_K4_Q")) if ("QD_K4_Q" in os.environ) else (0.5 * k4_map_base)
+                k4_c = float(os.getenv("QD_K4_CLOUD")) if ("QD_K4_CLOUD" in os.environ) else (0.25 * k4_map_base)
             else:
+                # No sigma4 provided: fall back to constant coefficients
                 k4_u = float(os.getenv("QD_K4_U", "1.0e14"))
                 k4_v = float(os.getenv("QD_K4_V", "1.0e14"))
                 k4_h = float(os.getenv("QD_K4_H", "5.0e13"))
@@ -553,8 +567,9 @@ class SpectralModel:
             self.v = self._hyperdiffuse(self.v, k4_v, dt, n_substeps=nsub)
             self.h = self._hyperdiffuse(self.h, k4_h, dt, n_substeps=nsub)
             # Optional: humidity and cloud fields (weaker, off by default)
-            apply_q = (k4_q > 0.0) or (int(os.getenv("QD_DIFF_Q", "0")) == 1)
-            apply_cloud = (k4_c > 0.0) or (int(os.getenv("QD_DIFF_CLOUD", "0")) == 1)
+            # k4_q / k4_c may be 2D maps; use any() to avoid ambiguous truth-value error
+            apply_q = (np.isscalar(k4_q) and (k4_q > 0.0)) or ((not np.isscalar(k4_q)) and np.any(k4_q > 0.0)) or (int(os.getenv("QD_DIFF_Q", "0")) == 1)
+            apply_cloud = (np.isscalar(k4_c) and (k4_c > 0.0)) or ((not np.isscalar(k4_c)) and np.any(k4_c > 0.0)) or (int(os.getenv("QD_DIFF_CLOUD", "0")) == 1)
             if apply_q and hasattr(self, "q"):
                 self.q = self._hyperdiffuse(self.q, k4_q, dt)
             if apply_cloud:

@@ -23,6 +23,9 @@ fi
 
 # -------- Common recommended settings (can be overridden by env) --------
 export QD_ENERGY_W="${QD_ENERGY_W:-1}"
+export QD_GH_LOCK="${QD_GH_LOCK:-0}"  # 禁用温室效应锁
+export QD_ENERGY_AUTOTUNE="${QD_ENERGY_AUTOTUNE:-1}" # 启用自动调谐
+export QD_GH_FACTOR="${QD_GH_FACTOR:-0.40}" # 保持一个合理的温室效应目标
 export QD_ENERGY_DIAG="${QD_ENERGY_DIAG:-1}"
 export QD_HUMIDITY_DIAG="${QD_HUMIDITY_DIAG:-1}"
 export QD_WATER_DIAG="${QD_WATER_DIAG:-1}"

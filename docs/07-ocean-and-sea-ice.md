@@ -82,6 +82,15 @@ C_s_map 构建
 - 开关：QD_OCEAN_POLAR_FIX=1（默认启用）；整圈全陆地时跳过
 
 
+### 7.5.1 极点硬约束（能量路径，P006）
+
+- 动机：在规则经纬度网格上，极点行（物理上单点）在数值上表现为一整圈经度样本；再叠加极点平均/一致化等处理，易将局部的“暖极”数值伪影放大为“南极无冰、周围有冰”的不物理状态。
+- 实现：在 energy 模块的 integrate_surface_energy_with_seaice 中加入南极行（lat = −90°）的硬约束：
+  - 条件：海洋格点且净热通量为冷却 Q_net < 0 且更新后 Ts_next > t_freeze
+  - 动作：将该格点的 Ts_next 钳制为 t_freeze，从而抵消数值性加热伪影，允许随后的相变公式在下一个时间步自然增长海冰。
+- 开关：QD_POLAR_FREEZE_FIX（默认 1=启用）；仅作用于南极行（grid.lat 从 −90→+90 递增时的第 0 行），后续可按需扩展到北极。
+- 相容性：不直接修改 h_ice；海冰相变、反照率与蒸发路径保持一致，能量与水量闭合诊断不受破坏。
+
 ## 7.6 接口与主循环集成（pygcm/ocean.py、scripts/run_simulation.py）
 
 - 初始化：WindDrivenSlabOcean(grid, land_mask, H_m)；与 GCM 共用网格以免插值
