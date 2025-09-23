@@ -42,6 +42,30 @@ export QD_SIGMA4="${QD_SIGMA4:-0.035}"
 export QD_SHAPIRO_EVERY="${QD_SHAPIRO_EVERY:-6}"
 export QD_SHAPIRO_N="${QD_SHAPIRO_N:-2}"
 
+# Diagnostics tests
+# 能量框架与诊断
+export QD_ENERGY_W=1
+export QD_ENERGY_DIAG=1
+
+# 关闭温室锁定；开启温和自调（步长温和，防止振荡）
+export QD_ENERGY_AUTOTUNE=1
+export QD_TUNE_RATE_EPS=2e-4
+export QD_TUNE_RATE_KC=8e-5
+# 初值给一个“偏强温室/偏弱 OLR”的起点，便于向 0 收敛
+export QD_LW_EPS0=0.88
+export QD_LW_KC=0.28
+
+# 短波给出温和大气吸收，降低 SW 直接进地表
+export QD_SW_A0=0.10
+export QD_SW_KC=0.15
+
+# 夜侧下限保持保守，避免夜侧冷塌对调参造成干扰
+export QD_T_FLOOR=160
+
+# 出图与步长
+export QD_PLOT_EVERY_DAYS=5
+
+
 # Plot cadence (reduce I/O for long runs)
 export QD_PLOT_EVERY_DAYS="${QD_PLOT_EVERY_DAYS:-20}"
 
