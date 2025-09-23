@@ -542,12 +542,19 @@ def main():
     # Initialize energy parameters and optional greenhouse autotuning
     print("Initializing energy parameters...")
     eparams = energy.get_energy_params_from_env()
-    AUTOTUNE = int(os.getenv("QD_ENERGY_AUTOTUNE", "0")) == 1
+    GH_LOCK = int(os.getenv("QD_GH_LOCK", "1")) == 1
+    AUTOTUNE = (not GH_LOCK) and (int(os.getenv("QD_ENERGY_AUTOTUNE", "0")) == 1)
     TUNE_EVERY = int(os.getenv("QD_ENERGY_TUNE_EVERY", "50"))
+    if GH_LOCK:
+        try:
+            g_fixed = float(os.getenv("QD_GH_FACTOR", "0.40"))
+        except Exception:
+            g_fixed = 0.40
+        print(f"[Greenhouse] Lock enabled: fixed g={g_fixed:.2f}; autotune disabled.")
 
     print("Initializing dynamics core with surface friction and greenhouse effect...")
     gcm = SpectralModel(
-        grid, friction_map, H=8000, tau_rad=10 * 24 * 3600, greenhouse_factor=0.3,
+        grid, friction_map, H=8000, tau_rad=10 * 24 * 3600, greenhouse_factor=float(os.getenv("QD_GH_FACTOR", "0.40")),
         C_s_map=C_s_map, land_mask=land_mask, Cs_ocean=Cs_ocean, Cs_land=Cs_land, Cs_ice=Cs_ice
     )
 

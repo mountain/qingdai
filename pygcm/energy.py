@@ -115,6 +115,25 @@ def longwave_radiation(Ts: np.ndarray, Ta: np.ndarray, cloud: np.ndarray, params
     LW_sfc = DLR - sigma * Ts4
     LW_atm = eps * (sigma * Ts4 - 2.0 * sigma * Ta4)
 
+    # Enforce fixed greenhouse factor g = 1 - OLR/(σ Ts^4) if enabled.
+    # Definition from user: g := 1 - OLR/(σ T^4). On Earth, g ≈ 0.40.
+    # We set OLR_target = (1 - g)*σ Ts^4 and DLR_target = g*σ Ts^4 and adjust LW_sfc accordingly.
+    try:
+        gh_lock = int(os.getenv("QD_GH_LOCK", "1")) == 1
+    except Exception:
+        gh_lock = True
+    if gh_lock:
+        try:
+            g_target = float(os.getenv("QD_GH_FACTOR", "0.40"))
+        except Exception:
+            g_target = 0.40
+        Ts4_raw = np.maximum(0.0, Ts) ** 4
+        OLR_target = (1.0 - g_target) * sigma * Ts4_raw
+        DLR_target = g_target * sigma * Ts4_raw
+        OLR = OLR_target
+        DLR = DLR_target
+        LW_sfc = DLR_target - sigma * Ts4
+
     return LW_atm, LW_sfc, OLR, DLR, eps
 
 
@@ -192,6 +211,25 @@ def longwave_radiation_v2(Ts: np.ndarray,
     LW_sfc = DLR - sigma * eps_sfc_arr * Ts4
     # Net on atmosphere: absorbed from surface minus its up+down emission
     LW_atm = eps_eff * (sigma * eps_sfc_arr * Ts4 - 2.0 * sigma * Ta4)
+
+    # Enforce fixed greenhouse factor g = 1 - OLR/(σ Ts^4) if enabled (default g≈0.40).
+    # For v2 with surface emissivity, use OLR_target = (1 - g)*σ Ts^4 and
+    # set DLR_target = g*σ Ts^4, while keeping the surface emissivity in LW_sfc.
+    try:
+        gh_lock = int(os.getenv("QD_GH_LOCK", "1")) == 1
+    except Exception:
+        gh_lock = True
+    if gh_lock:
+        try:
+            g_target = float(os.getenv("QD_GH_FACTOR", "0.40"))
+        except Exception:
+            g_target = 0.40
+        Ts4_raw = np.maximum(0.0, Ts) ** 4
+        OLR_target = (1.0 - g_target) * sigma * Ts4_raw
+        DLR_target = g_target * sigma * Ts4_raw
+        OLR = OLR_target
+        DLR = DLR_target
+        LW_sfc = DLR_target - sigma * eps_sfc_arr * Ts4
 
     return LW_atm, LW_sfc, OLR, DLR, eps_eff
 

@@ -48,6 +48,8 @@
 - QD_ENERGY_W（0..1，默认 0）能量收支权重；=1 时完全使用显式能量路径  
 - QD_ENERGY_DIAG（默认 1）定期打印 TOA/SFC/ATM 收支诊断  
 - QD_T_FLOOR（默认 150 K）夜侧/高原温度下限（地表能量积分保护）
+- QD_GH_LOCK（默认 1）固定温室效应因子 g，按 g = 1 − OLR/(σ Ts^4) 强制长波出流与下行长波（见 energy.py）  
+- QD_GH_FACTOR（默认 0.40）固定的温室因子 g（地球量级 ≈ 0.4）；当 QD_GH_LOCK=1 时自动禁用 QD_ENERGY_AUTOTUNE，且动力学旧路径的 greenhouse_factor 亦从该值读取
 
 短波与长波（简化参数化，实际实现见 `pygcm/energy.py`）：
 - QD_SW_A0（默认 0.06）大气短波基吸收  
