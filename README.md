@@ -73,6 +73,25 @@
     - True Color 可视化：`QD_TRUECOLOR_ICE_FRAC`（冰显示阈值，默认 0.15）、`QD_TRUECOLOR_CLOUD_ALPHA`（云不透明度，默认 0.60）、`QD_TRUECOLOR_CLOUD_WHITE`（云白度，默认 0.95）、`QD_TRUECOLOR_SNOW_BY_TS`（是否按温度渲染陆地积雪，默认 0）
     - 说明：脚本启动时会打印地形来源、海陆比例、反照率/摩擦统计等日志，便于检查。
 
+- 生成水文路由网络（P014，一次性）：
+  - 使用 data 下最新地形（包含 elevation/land_mask）：
+    - `export QD_TOPO_NC=$(ls -t data/topography_*.nc | head -n1)`
+    - `python3 -m scripts.generate_hydrology_maps --topo "$QD_TOPO_NC" --out data/hydrology_network.nc`
+  - 未提供外部地形时脚本会回退生成 `land_mask` 并以平坦高程计算 D8（可运行但河网不真实）
+
+- 启用在线径流路由与河网/湖泊叠加（P014 M2–M4）：
+  - 最小环境变量：
+    - `export QD_HYDRO_ENABLE=1`
+    - `export QD_HYDRO_NETCDF=data/hydrology_network.nc`
+    - `export QD_HYDRO_DT_HOURS=6`    # 路由步长（小时）
+    - `export QD_PLOT_RIVERS=1`       # 在状态图与 TrueColor 叠加河网/湖泊
+  - 可选可视化参数：
+    - `export QD_RIVER_MIN_KGPS=1e6`  # 河网阈值（kg/s），仅显示主干
+    - `export QD_RIVER_ALPHA=0.35`    # 状态图河网透明度（TrueColor 内部为 0.45）
+    - `export QD_LAKE_ALPHA=0.40`     # 湖泊透明度
+  - 运行：
+    - `python3 -m scripts.run_simulation`
+
 
 参考阅读：
 1.  了解世界观与时间节律：阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)

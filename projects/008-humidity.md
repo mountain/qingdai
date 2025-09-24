@@ -31,6 +31,7 @@
 - 快速验证（短程，不出图）：
   ```bash
   QD_ENERGY_W=1 QD_ENERGY_DIAG=1 QD_HUMIDITY_DIAG=1 \
+  # 单位：行星日
   QD_SIM_DAYS=0.5 QD_PLOT_EVERY_DAYS=1000 \
   python3 -m scripts.run_simulation
   ```

@@ -2,10 +2,10 @@
 
 状态（2025‑09‑24）
 - [x] 文档与方案定稿（本文件）
-- [ ] M1：离线流向网络与湖泊盆地预计算工具（脚本）
-- [ ] M2：在线径流演算与流量累积模块（`pygcm/routing.py`）
-- [ ] M3：GCM 主循环集成与新诊断输出（含湖泊）
-- [ ] M4：可视化增强（河流网络与湖泊叠加）
+- [x] M1：离线流向网络与湖泊盆地预计算工具（脚本：`scripts/generate_hydrology_maps.py`）
+- [x] M2：在线径流演算与流量累积模块（`pygcm/routing.py`，RiverRouting）
+- [x] M3：GCM 主循环集成与新诊断输出（含湖泊；`scripts/run_simulation.py`）
+- [x] M4：可视化增强（状态图与 TrueColor 叠加河流网络/湖泊图层）
 - [ ] M5：参数标定与验证（径流时标、汇流速度等）
 
 关联模块与文档
@@ -166,10 +166,10 @@ routing = RiverRouting(grid, hydro_nc, dt_hydro_hours=float(os.getenv("QD_HYDRO_
 
 2) 每步调用（在 P009 完成 R 更新之后）
 ```python
-routing.step(R_land_flux=hydrology.R_land_flux,  # kg m^-2 s^-1 on land
+routing.step(R_land_flux=R_flux_land,   # kg m^-2 s^-1 on land（由 update_land_bucket 返回的 runoff）
              dt_seconds=dt,
-             precip_flux=precip_flux,            # 若易得，传入以支持湖面 P−E
-             evap_flux=evap_flux)
+             precip_flux=P_flux,        # 若可得，传入湖面 P，用于湖库局地平衡
+             evap_flux=E_flux)          # 若可得，传入湖面 E，用于湖库局地平衡
 ```
 
 3) 诊断/出图（按 `QD_PLOT_EVERY_DAYS`）
@@ -215,9 +215,12 @@ diag = routing.diagnostics()
 
 - 日志（建议每次水文步长后）：
   - `[HydroRouting] ocean_inflow=... kg/s, max_flow=... kg/s, n_lakes=..., mass_error=... kg`
-- 图层（与状态图叠加）：
-  - 河网（flow_accum）：对数色标或阈值二值化（突出主干河流）
-  - 湖泊（lake_mask）：半透明填色；可标注主要湖泊的溢出口
+- 图层（与状态图叠加；M4 已集成）：
+  - 河网（flow_accum_kgps）：在状态图（Ts 面板、Ocean 面板）以二值等值线叠加主干河流；
+    - 阈值：`QD_RIVER_MIN_KGPS`（默认 1e6 kg/s）；透明度：`QD_RIVER_ALPHA`（默认 0.35）
+  - 湖泊（lake_mask）：在上述面板以等值线勾勒（透明度 `QD_LAKE_ALPHA`，默认 0.40）
+  - TrueColor 图：将主干河流/湖泊以半透明方式混合进 RGB 底图（河网默认 alpha=0.45）
+  - 总开关：`QD_PLOT_RIVERS=1`（默认开启；设 0 关闭叠加）
 - 时间序列（可选）：全球总湖量、最大/平均流量、入海通量
 
 

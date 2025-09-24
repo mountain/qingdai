@@ -106,7 +106,7 @@ Spin-up 分两阶段连续执行；阶段二以阶段一的重启文件作为初
 重启/运行：
 - QD_RESTART_IN：阶段二的输入重启文件路径
 - QD_RESTART_OUT：当前运行输出重启文件路径
-- QD_SIM_DAYS / QD_TOTAL_YEARS：控制总时长（任选其一，视脚本支持）
+- QD_SIM_DAYS / QD_TOTAL_YEARS：控制总时长（任选其一，视脚本支持；QD_SIM_DAYS 单位：行星日，QD_TOTAL_YEARS 单位：行星年）
 - QD_PLOT_EVERY_DAYS：出图间隔
 
 （若脚本尚未实现 QD_RESTART_IN/OUT 或 QD_TOTAL_YEARS，请按本项目落地时补齐，保持与 README 的运行风格一致。）

@@ -196,11 +196,18 @@ Shapiro 与谱带阻：
 
 ## 10) 路由与湖泊（P014）
 
+- QD_HYDRO_ENABLE（默认 1）：开启/关闭在线径流路由模块（RiverRouting）  
 - QD_HYDRO_NETCDF（默认 data/hydrology_network.nc）：离线路由网络（flow_to_index/flow_order/lake_*）NetCDF  
 - QD_HYDRO_DT_HOURS（默认 6）：水文步长（小时），达到该累计时长时执行一次全图路由/湖泊水量更新  
 - QD_TREAT_LAKE_AS_WATER（默认 1）：湖面在能量/湿度路径上按水体（海洋）处理  
 - QD_ALPHA_LAKE（可选）：覆盖湖面基础反照率（不设则与海洋相同）  
 - QD_HYDRO_DIAG（默认 1）：打印路由诊断（入海通量、最大流量、质量闭合误差等）  
+
+可视化（河网/湖泊叠加，M4）：
+- QD_PLOT_RIVERS（默认 1）：在状态图与 TrueColor 上叠加河网与湖泊图层  
+- QD_RIVER_MIN_KGPS（默认 1e6）：河网显示阈值（kg/s），仅显示主干河流（可按分辨率/需要调整）  
+- QD_RIVER_ALPHA（默认 0.35；TrueColor 中 0.45）：河网叠加透明度  
+- QD_LAKE_ALPHA（默认 0.40）：湖泊叠加透明度  
 
 # 推荐配置与使用指引
 

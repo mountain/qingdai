@@ -74,6 +74,6 @@
 - **云寿命**：经验性 2 天 e-folding（缓解过快消散）。
 - **地表摩擦**：使用海陆差异摩擦图（`pygcm/topography.generate_base_properties`），陆地强、海洋弱。
 - **运行控制（环境变量）**：
-  - `QD_SIM_DAYS`、`QD_PLOT_EVERY_DAYS`、`QD_DT_SECONDS`：积分时长 / 出图频率 / 步长。
+  - `QD_SIM_DAYS`（单位：行星日）、`QD_PLOT_EVERY_DAYS`（单位：行星日）、`QD_DT_SECONDS`（单位：秒）：积分时长 / 出图频率 / 步长。
   - `QD_CMAX`、`QD_PREF`：云-雨关系参数（$C_{\max}$、$P_{\mathrm{ref}}$）。
   - `QD_W_MEM`、`QD_W_P`、`QD_W_SRC`：云量融合权重。

@@ -21,6 +21,7 @@ from pygcm.dynamics import SpectralModel
 from pygcm.topography import create_land_sea_mask, generate_base_properties, load_topography_from_netcdf
 from pygcm.physics import diagnose_precipitation, diagnose_precipitation_hybrid, parameterize_cloud_cover, calculate_dynamic_albedo, cloud_from_precip, compute_orographic_factor
 from pygcm.hydrology import get_hydrology_params_from_env, partition_precip_phase, snow_step, update_land_bucket, diagnose_water_closure
+from pygcm.routing import RiverRouting
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
 from pygcm.jax_compat import is_enabled as JAX_IS_ENABLED
@@ -120,7 +121,7 @@ def apply_banded_initial_ts(grid, gcm, ocean, land_mask):
         ocean.Ts = np.where(ocean_mask, Ts0, ocean.Ts)
     print(f"[Init] Applied banded initial Ts: T_eq={T_eq} K, T_pole={T_pole} K")
 
-def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output_dir, ocean=None):
+def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output_dir, ocean=None, routing=None):
     """
     Generates and saves a 3-column x 5-row diagnostic plot of the current model state.
     Panels (left→right, top→bottom):
@@ -301,12 +302,35 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
         ax.set_xlim(0, 360)
         ax.set_ylim(-90, 90)
 
+    # Overlay rivers and lakes (P014) on selected panels
+    try:
+        if routing is not None and int(os.getenv("QD_PLOT_RIVERS", "1")) == 1:
+            import numpy as _np
+            rd = routing.diagnostics()
+            flow = _np.asarray(rd.get("flow_accum_kgps", _np.zeros_like(grid.lat_mesh)))
+            river_min = float(os.getenv("QD_RIVER_MIN_KGPS", "1e6"))
+            river_alpha = float(os.getenv("QD_RIVER_ALPHA", "0.35"))
+            if _np.any(flow >= river_min):
+                # Binary mask of major rivers, draw as contour lines
+                river_mask = (flow >= river_min).astype(float)
+                for _ax in (axes[0, 0], axes[2, 1]):  # Ts panel and Ocean panel
+                    _ax.contour(grid.lon, grid.lat, river_mask, levels=[0.5],
+                                colors="deepskyblue", linewidths=1.0, alpha=river_alpha)
+            lake_mask = getattr(routing, "lake_mask", None)
+            if lake_mask is not None and _np.any(lake_mask):
+                lake_alpha = float(os.getenv("QD_LAKE_ALPHA", "0.40"))
+                for _ax in (axes[0, 0], axes[2, 1]):
+                    _ax.contour(grid.lon, grid.lat, lake_mask.astype(float), levels=[0.5],
+                                colors="dodgerblue", linewidths=0.8, alpha=lake_alpha)
+    except Exception:
+        pass
+
     # Save
     filename = os.path.join(output_dir, f"state_day_{t_days:05.1f}.png")
     plt.savefig(filename, dpi=140)
     plt.close(fig)
 
-def plot_true_color(grid, gcm, land_mask, t_days, output_dir):
+def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None):
     """
     Generates and saves a pseudo-true-color plot of the planet.
 
@@ -345,6 +369,26 @@ def plot_true_color(grid, gcm, land_mask, t_days, output_dir):
     cloud_white = float(os.getenv("QD_TRUECOLOR_CLOUD_WHITE", "0.95"))  # 0..1
     cloud_layer = np.stack([gcm.cloud_cover, gcm.cloud_cover, gcm.cloud_cover], axis=-1)
     rgb_map = rgb_map * (1.0 - cloud_alpha * cloud_layer) + (cloud_alpha * cloud_layer) * cloud_white
+
+    # Rivers/Lakes overlay (blend into RGB map)
+    try:
+        if routing is not None and int(os.getenv("QD_PLOT_RIVERS", "1")) == 1:
+            import numpy as _np
+            rd = routing.diagnostics()
+            flow = _np.asarray(rd.get("flow_accum_kgps", _np.zeros_like(gcm.T_s)))
+            river_min = float(os.getenv("QD_RIVER_MIN_KGPS", "1e6"))
+            river_color = np.array([0.05, 0.35, 0.90])
+            river_alpha = float(os.getenv("QD_RIVER_ALPHA", "0.45"))
+            river_mask = (flow >= river_min).astype(float)[..., None]
+            rgb_map = rgb_map * (1.0 - river_alpha * river_mask) + river_color * (river_alpha * river_mask)
+        lake_mask = getattr(routing, "lake_mask", None)
+        if lake_mask is not None and np.any(lake_mask):
+            lake_color = np.array([0.15, 0.55, 0.95])
+            lake_alpha = float(os.getenv("QD_LAKE_ALPHA", "0.40"))
+            lake_mask3 = lake_mask.astype(float)[..., None]
+            rgb_map = rgb_map * (1.0 - lake_alpha * lake_mask3) + lake_color * (lake_alpha * lake_mask3)
+    except Exception:
+        pass
 
     # Clamp
     rgb_map = np.clip(rgb_map, 0.0, 1.0)
@@ -585,6 +629,25 @@ def main():
     S_snow = np.zeros_like(grid.lat_mesh, dtype=float)   # land snow water-equivalent (kg m^-2)
     _hydro_prev_total = None
     _hydro_prev_time = None
+
+    # Routing (P014): optional river routing and lakes via offline network
+    routing = None
+    try:
+        hydro_net = os.getenv("QD_HYDRO_NETCDF", "data/hydrology_network.nc")
+        if int(os.getenv("QD_HYDRO_ENABLE", "1")) == 1 and hydro_net and os.path.exists(hydro_net):
+            routing = RiverRouting(
+                grid,
+                hydro_net,
+                dt_hydro_hours=float(os.getenv("QD_HYDRO_DT_HOURS", "6")),
+                treat_lake_as_water=(int(os.getenv("QD_TREAT_LAKE_AS_WATER", "1")) == 1),
+                alpha_lake=(float(os.getenv("QD_ALPHA_LAKE")) if os.getenv("QD_ALPHA_LAKE") else None),
+                diag=(int(os.getenv("QD_HYDRO_DIAG", "1")) == 1),
+            )
+        else:
+            print(f"[HydroRouting] Disabled or network file not found (QD_HYDRO_NETCDF='{hydro_net}').")
+    except Exception as e:
+        print(f"[HydroRouting] Initialization skipped due to error: {e}")
+        routing = None
 
     # --- Restart load or banded initialization ---
     restart_in = os.getenv("QD_RESTART_IN")
@@ -885,6 +948,13 @@ def main():
             # Land bucket update: inputs = rain + snowmelt; evaporation removes; runoff returned to ocean
             P_in_land = P_rain_land + melt_flux_land
             W_land, R_flux_land = update_land_bucket(W_land, P_in_land, E_land, hydro_params, dt)
+            # P014: route runoff along offline network (if enabled)
+            if 'routing' in locals() and routing is not None:
+                try:
+                    routing.step(R_land_flux=R_flux_land, dt_seconds=dt, precip_flux=P_flux, evap_flux=E_flux)
+                except Exception as _re:
+                    if i == 0:
+                        print(f"[HydroRouting] step skipped due to error: {_re}")
 
             # Diagnostics: global water closure (area-weighted)
             if getattr(hydro_params, "diag", True) and (i % 200 == 0):
@@ -922,6 +992,16 @@ def main():
                     msg += (f" | d/dt Σ={diag_h2o['d/dt_total_mean']:.3e} vs (E−P−R) -> "
                             f"residual={diag_h2o['closure_residual']:.3e}")
                 print(msg)
+                # Optional routing diagnostics
+                if 'routing' in locals() and routing is not None:
+                    rd = routing.diagnostics()
+                    try:
+                        max_flow = float(np.nanmax(rd["flow_accum_kgps"]))
+                    except Exception:
+                        max_flow = 0.0
+                    print(f"[HydroRoutingDiag] ocean_inflow={rd['ocean_inflow_kgps']:.3e} kg/s | "
+                          f"mass_error={rd['mass_closure_error_kg']:.3e} kg | "
+                          f"max_flow={max_flow:.3e} kg/s")
 
                 # Update prev totals/time
                 _hydro_prev_total = diag_h2o["total_reservoir_mean"]
@@ -942,8 +1022,8 @@ def main():
         
         if i % plot_interval_steps == 0:
             # Plot instantaneous precipitation rate (kg m^-2 s^-1 ⇒ mm/day)
-            plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean)
-            plot_true_color(grid, gcm, land_mask, t_days, output_dir)
+            plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean, routing=routing)
+            plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing)
             # Diagnostics: per-star ISR components (disabled by default; enable with QD_PLOT_ISR=1)
             if PLOT_ISR:
                 plot_isr_components(grid, gcm, t_days, output_dir)

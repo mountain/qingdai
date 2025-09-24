@@ -30,6 +30,7 @@
   - `QD_ATM_H`、`QD_RHO_A`：大气单层有效厚度与密度（用于将能量通量转为 h 的倾向，M3）。
 - 快速验证（短时、不出图）：
   ```
+  # 单位：行星日
   QD_ENERGY_W=1 QD_ENERGY_DIAG=1 QD_SIM_DAYS=0.05 QD_PLOT_EVERY_DAYS=100 python3 -m scripts.run_simulation
   ```
 - 后续里程碑：M4 能量闭合诊断（TOA/SFC/ATM）与长期守恒验证；M5 参数标定与默认参数组。

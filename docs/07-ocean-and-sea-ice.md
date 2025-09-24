@@ -150,6 +150,7 @@ python3 -m scripts.run_simulation
 
 快速烟测（安全步长/限幅）
 ```bash
+# 单位：行星日
 export QD_SIM_DAYS=0.02
 export QD_DT_SECONDS=120
 export QD_OCEAN_CFL=0.4
