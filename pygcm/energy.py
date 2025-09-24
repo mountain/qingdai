@@ -124,9 +124,9 @@ def longwave_radiation(Ts: np.ndarray, Ta: np.ndarray, cloud: np.ndarray, params
         gh_lock = True
     if gh_lock:
         try:
-            g_target = float(os.getenv("QD_GH_FACTOR", "0.00"))
+            g_target = float(os.getenv("QD_GH_FACTOR", "0.20"))
         except Exception:
-            g_target = 0.00
+            g_target = 0.20
         Ts4_raw = np.maximum(0.0, Ts) ** 4
         OLR_target = (1.0 - g_target) * sigma * Ts4_raw
         DLR_target = g_target * sigma * Ts4_raw
@@ -221,9 +221,9 @@ def longwave_radiation_v2(Ts: np.ndarray,
         gh_lock = True
     if gh_lock:
         try:
-            g_target = float(os.getenv("QD_GH_FACTOR", "0.00"))
+            g_target = float(os.getenv("QD_GH_FACTOR", "0.20"))
         except Exception:
-            g_target = 0.00
+            g_target = 0.20
         Ts4_raw = np.maximum(0.0, Ts) ** 4
         OLR_target = (1.0 - g_target) * sigma * Ts4_raw
         DLR_target = g_target * sigma * Ts4_raw

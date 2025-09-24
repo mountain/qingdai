@@ -923,9 +923,11 @@ def main():
 
         # 3c. Hydrology step (P009): E–P–R, snow and water-closure diagnostics
         try:
-            # Fluxes from humidity module (kg m^-2 s^-1)
+            # Fluxes for hydrology (kg m^-2 s^-1)
+            # Use diagnosed precipitation (hybrid precip) for hydrology/routing instead of P_cond,
+            # otherwise P=0 will prevent buckets from filling and R=0 forever.
             E_flux = getattr(gcm, "E_flux_last", 0.0)
-            P_flux = getattr(gcm, "P_cond_flux_last", 0.0)
+            P_flux = precip
 
             # Ensure array shape
             if np.isscalar(E_flux):
@@ -977,7 +979,7 @@ def main():
                     W_land=W_land,
                     S_snow=S_snow,
                     E_flux=E_flux,
-                    P_flux=P_flux,
+                    P_flux=P_flux,        # use diagnosed precip (hybrid), not P_cond
                     R_flux=R_flux_land,   # runoff only from land
                     dt_since_prev=dt_since_prev,
                     prev_total=_hydro_prev_total
