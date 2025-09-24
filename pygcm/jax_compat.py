@@ -39,18 +39,21 @@ if _JAX_ENABLED:
         if plat_env:
             # Note: Must be set before JAX backend initialization in real systems;
             os.environ.setdefault("JAX_PLATFORM_NAME", plat_env)
-        # Detect backend after import
+        # Detect backend by devices first, fallback to default_backend
         try:
-            _JAX_BACKEND = _JAX.default_backend() or "unknown"
+            devs = _JAX.devices()
+            if devs:
+                _JAX_BACKEND = getattr(devs[0], "platform", "unknown")
+            else:
+                _JAX_BACKEND = _JAX.default_backend() or "unknown"
         except Exception:
             _JAX_BACKEND = "unknown"
-        # Gate enablement: only enable by default on CUDA/TPU backends to avoid slowdowns
-        # Allow override with QD_JAX_FORCE=1
-        if _JAX_BACKEND not in ("gpu", "tpu") and os.getenv("QD_JAX_FORCE", "0") != "1":
+        # Enable only on real accelerators unless forced
+        if (_JAX_BACKEND in ("gpu", "cuda", "tpu")) or (os.getenv("QD_JAX_FORCE", "0") == "1"):
+            _JAX_ENABLED = True
+        else:
             # Disable JAX path; fallback to NumPy/SciPy as default for cpu/metal
             _JAX_ENABLED = False
-        else:
-            _JAX_ENABLED = True
     except Exception:
         # If import fails, silently disable JAX
         _JAX = None
