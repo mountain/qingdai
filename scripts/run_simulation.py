@@ -311,8 +311,8 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
             river_min = float(os.getenv("QD_RIVER_MIN_KGPS", "1e6"))
             river_alpha = float(os.getenv("QD_RIVER_ALPHA", "0.35"))
             if _np.any(flow >= river_min):
-                # Binary mask of major rivers, draw as contour lines
-                river_mask = (flow >= river_min).astype(float)
+                # Binary mask of major rivers (land-only), draw as contour lines
+                river_mask = ((flow >= river_min) & (land_mask == 1)).astype(float)
                 for _ax in (axes[0, 0], axes[2, 1]):  # Ts panel and Ocean panel
                     _ax.contour(grid.lon, grid.lat, river_mask, levels=[0.5],
                                 colors="deepskyblue", linewidths=1.0, alpha=river_alpha)
@@ -379,13 +379,14 @@ def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None):
             river_min = float(os.getenv("QD_RIVER_MIN_KGPS", "1e6"))
             river_color = np.array([0.05, 0.35, 0.90])
             river_alpha = float(os.getenv("QD_RIVER_ALPHA", "0.45"))
-            river_mask = (flow >= river_min).astype(float)[..., None]
+            land3 = (land_mask == 1).astype(float)[..., None]
+            river_mask = ((flow >= river_min).astype(float)[..., None]) * land3
             rgb_map = rgb_map * (1.0 - river_alpha * river_mask) + river_color * (river_alpha * river_mask)
         lake_mask = getattr(routing, "lake_mask", None)
         if lake_mask is not None and np.any(lake_mask):
             lake_color = np.array([0.15, 0.55, 0.95])
             lake_alpha = float(os.getenv("QD_LAKE_ALPHA", "0.40"))
-            lake_mask3 = lake_mask.astype(float)[..., None]
+            lake_mask3 = (lake_mask.astype(float) * (land_mask == 1).astype(float))[..., None]
             rgb_map = rgb_map * (1.0 - lake_alpha * lake_mask3) + lake_color * (lake_alpha * lake_mask3)
     except Exception:
         pass

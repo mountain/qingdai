@@ -115,6 +115,7 @@ def compute_flow_to_index(grid: SphericalGrid, elev: np.ndarray, land_mask: np.n
     """
     Compute D8 downstream indices using steepest descent with spherical distances.
     Returns array int64 of shape (n_lat, n_lon), with -1 for ocean sinks and terminal sinks.
+    Note: If the steepest neighbor is ocean, encode -1 (ocean sink) instead of pointing to an ocean cell.
     """
     n_lat, n_lon = elev.shape
     flow_to = np.full((n_lat, n_lon), -1, dtype=np.int64)
@@ -126,7 +127,8 @@ def compute_flow_to_index(grid: SphericalGrid, elev: np.ndarray, land_mask: np.n
                 continue
             z0 = elev[j, i]
             best_slope = -np.inf
-            best_idx = -1
+            best_ii = -1
+            best_jj = -1
             for ii, jj in neighbors_d8(i, j, n_lon, n_lat):
                 dist = spherical_distance(grid, i, j, ii, jj)
                 if dist <= 0:
@@ -135,10 +137,14 @@ def compute_flow_to_index(grid: SphericalGrid, elev: np.ndarray, land_mask: np.n
                 slope = (z0 - z1) / dist  # positive = downhill
                 if slope > best_slope:
                     best_slope = slope
-                    best_idx = row_major_index(ii, jj, n_lon)
+                    best_ii, best_jj = ii, jj
 
-            if best_slope > 0 and best_idx >= 0:
-                flow_to[j, i] = best_idx
+            if best_slope > 0 and best_ii >= 0:
+                # If downstream is ocean, mark as ocean sink (-1), do not point into ocean grid
+                if land_mask[best_jj, best_ii] == 1:
+                    flow_to[j, i] = row_major_index(best_ii, best_jj, n_lon)
+                else:
+                    flow_to[j, i] = -1
             else:
                 flow_to[j, i] = -1
     return flow_to
@@ -218,6 +224,55 @@ def identify_lakes(flow_to: np.ndarray, land_mask: np.ndarray) -> Tuple[np.ndarr
     return lake_mask, lake_id, lake_count
 
 
+def compute_lake_outlets(grid: SphericalGrid,
+                         elev_filled: np.ndarray,
+                         lake_mask: np.ndarray,
+                         lake_id: np.ndarray,
+                         land_mask: np.ndarray) -> np.ndarray:
+    """
+    For each lake (connected component where lake_mask==1), determine an outlet:
+      - If any lake cell touches ocean (land_mask==0) in its D8 neighborhood, mark outlet as -1 (direct ocean sink).
+      - Else choose the neighboring non-lake land cell with the lowest filled elevation as the outlet (row-major index).
+      - If neither is found (should not happen with proper pit-filling), set -1.
+    Returns:
+      lake_outlet_index: (n_lakes,) int32 array (row-major indices or -1 for direct ocean sink).
+    """
+    n_lat, n_lon = lake_mask.shape
+    n_lakes = int(np.max(lake_id)) if lake_id is not None else 0
+    out = np.full((max(n_lakes, 0),), -1, dtype=np.int32)
+    if n_lakes == 0:
+        return out
+
+    for k in range(1, n_lakes + 1):
+        best_idx = -1
+        best_z = np.inf
+        touches_ocean = False
+
+        # iterate over cells of this lake
+        js, is_ = np.where(lake_id == k)
+        for j, i in zip(js, is_):
+            for ii, jj in neighbors_d8(i, j, n_lon, n_lat):
+                if lake_mask[jj, ii] == 1:
+                    continue  # still lake
+                if land_mask[jj, ii] == 0:
+                    touches_ocean = True
+                    break
+                # neighbor is land and not lake: candidate outlet via non-lake land cell
+                z = float(elev_filled[jj, ii])
+                if z < best_z:
+                    best_z = z
+                    best_idx = row_major_index(ii, jj, n_lon)
+            if touches_ocean:
+                break
+
+        if touches_ocean:
+            out[k - 1] = -1  # direct ocean sink
+        else:
+            out[k - 1] = int(best_idx) if best_idx >= 0 else -1
+
+    return out
+
+
 def main():
     _require_netcdf()
 
@@ -266,7 +321,7 @@ def main():
 
     print("[HydroNet] Identifying lakes...")
     lake_mask, lake_id, n_lakes = identify_lakes(flow_to, land_mask)
-    lake_outlet_index = np.full((n_lakes,), -1, dtype=np.int32) if n_lakes > 0 else None
+    lake_outlet_index = compute_lake_outlets(grid, elev_filled, lake_mask, lake_id, land_mask) if n_lakes > 0 else None
 
     print("[HydroNet] Computing topological flow order...")
     flow_order = topo_sort_flow_order(flow_to, land_mask)

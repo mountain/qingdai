@@ -112,6 +112,8 @@ class RiverRouting:
             self.land_mask = (rvar("land_mask") > 0).astype(np.uint8)
             if self.land_mask is None:
                 raise RuntimeError("hydrology_network.nc missing 'land_mask' variable")
+            # Flat land mask for quick membership tests (row-major)
+            self.land_flat = (self.land_mask.flatten(order="C") == 1)
 
             flow_to = rvar("flow_to_index")
             if flow_to is None:
@@ -264,19 +266,21 @@ class RiverRouting:
             # Record mass passing through this cell (for flow accumulation map)
             self._flow_accum_kg[idx] += m
 
-            # Lakes: pass-through to lake outlet (if provided), else act like local sink (store)
+            # Lakes: pass-through to outlet; if outlet==-1, treat as ocean sink; else store if no outlet
             if has_lakes and lake_cell_is_lake[idx]:
                 lid = int(lake_ids_flat[idx])
                 if lid > 0 and lake_outlet is not None and lid <= lake_outlet.shape[0]:
                     outlet_idx = int(lake_outlet[lid - 1])
-                    if 0 <= outlet_idx < self.n_cells:
+                    if outlet_idx < 0:
+                        # Direct ocean sink for this lake
+                        self._ocean_inflow_kg += m
+                    elif 0 <= outlet_idx < self.n_cells and self.land_flat[outlet_idx]:
                         acc[outlet_idx] += m
                     else:
-                        # Invalid outlet -> treat as internal terminal (store)
-                        if self.lake_volume_kg is not None:
-                            self.lake_volume_kg[lid - 1] += m
+                        # Outlet points outside land domain (treat as ocean)
+                        self._ocean_inflow_kg += m
                 else:
-                    # No outlet known -> store
+                    # No outlet known -> store internally
                     if self.lake_volume_kg is not None and lid > 0:
                         self.lake_volume_kg[lid - 1] += m
 
@@ -285,7 +289,8 @@ class RiverRouting:
 
             # Normal land cell: route to downstream or ocean
             dn = int(self.flow_to_index.flatten(order="C")[idx])
-            if dn < 0:
+            # Treat any non-land downstream (including ocean) as ocean sink
+            if dn < 0 or not self.land_flat[dn]:
                 self._ocean_inflow_kg += m
                 acc[idx] = 0.0
             else:
