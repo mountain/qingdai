@@ -250,6 +250,68 @@ Shapiro 与谱带阻：
 
 ---
 
+## 11) 生态模块（P015：Emergent Ecology & Spectral Dynamics）
+
+双时序（时级/日级）生态接口，用于植被—辐射即时耦合与日级慢过程（形态投资、生命周期、繁殖/传播）。
+
+主控与步长
+- QD_ECO_ENABLE（默认 0）：开启/关闭生态模块（Plant/PopulationManager）。  
+- QD_ECO_DT_DAYS（默认 1.0）：生态日级更新步长（天），用于慢路径。  
+- QD_ECO_SUBDAILY_ENABLE（默认 1）：启用与物理步对齐的时级子步接口。  
+- QD_ECO_SUBSTEP_EVERY_NPHYS（默认 1）：每 N 个物理步调用一次时级子步。  
+- QD_ECO_DT_HOURS（默认 自动由 dt_seconds 换算）：用于时级诊断打印。  
+- QD_ECO_FEEDBACK_MODE（instant|daily，默认 instant）：反照率写回短波的策略；即时/仅日末。  
+- QD_ECO_ALBEDO_COUPLE_FREQ（subdaily|daily，默认 subdaily）：反照率写回频率。
+
+光谱与带宽（与 docs/14 对齐）
+- QD_ECO_SPECTRAL_BANDS（默认 8）：短波离散波段数（带分辨）。  
+- QD_ECO_SPECTRAL_RANGE_NM（默认 380,780）：可见光范围（nm，下限,上限）。  
+- QD_ECO_TOA_TO_SURF_MODE（simple|rayleigh|custom，默认 simple）：层顶→地表光谱调制模式。  
+- QD_ECO_RAYLEIGH_T0（默认 0.9）：Rayleigh 模式基础透过率。  
+- QD_ECO_RAYLEIGH_LREF_NM（默认 550）：Rayleigh 参照波长（nm）。  
+- QD_ECO_RAYLEIGH_ETA（默认 4.0）：Rayleigh 衰减指数。  
+- QD_ECO_SOIL_SPECTRUM（路径，可选）：土壤背景光谱文件。  
+- QD_ECO_TRUECOLOR_ENABLE（默认 1）：启用基于 CIE 的 TrueColor 渲染（可视化）。  
+- QD_ECO_TRUECOLOR_GAMMA（默认 2.2）：TrueColor gamma 校正。
+
+光竞争（冠层）
+- QD_ECO_LIGHT_K（默认 0.5）：冠层光衰减系数（Beer-Lambert 型）。  
+- QD_ECO_LIGHT_UPDATE_EVERY_HOURS（默认 6）：时级重算冠层/反照率的最小间隔（小时）。  
+- QD_ECO_LIGHT_RECOMPUTE_LAI_DELTA（默认 0.05）：LAI 相对变化阈值，超过强制重算。
+
+水竞争（根系）
+- QD_ECO_WATER_PRIORITY（root_mass|depth_weighted，默认 root_mass）：根系权重策略。  
+- QD_ECO_SOIL_WATER_CAP（可选）：单日或小时可用水上限比例（归一化），超出截断。
+
+形态/投资/物候（个体级，docs/13）
+- QD_ECO_SEED_GERMINATE_GDD（默认 80）：发芽积温阈值。  
+- QD_ECO_STRESS_WATER_DAYS（默认 7）：连续水分胁迫进入衰老阈值（天）。  
+- QD_ECO_ALLOC_ROOT（可选）：覆盖基因的根投资比例（0..1）。  
+- QD_ECO_ALLOC_STEM（可选）：覆盖基因的茎投资比例（0..1）。  
+- QD_ECO_ALLOC_LEAF（可选）：覆盖基因的叶投资比例（0..1）。  
+- QD_ECO_HEIGHT_EXPONENT（默认 0.8）：height ∝ stem_mass^γ 的 γ。  
+- QD_ECO_REPRO_FRACTION（默认 0.2）：成熟期用于繁殖的能量比例。  
+- QD_ECO_MAINT_COST（默认 0）：维护能量成本（若启用，从日能量中扣除）。  
+- QD_ECO_MIN_LEAF_AREA（默认 0）：小于该叶面积阈值进入 SENESCENT/DEAD。
+
+演化/传播（种群级，docs/15）
+- QD_ECO_SEED_BANK_MAX（默认 1000）：本地种子库容量上限（溢出丢弃或劣化）。  
+- QD_ECO_LONGDIST_FRAC（默认 0.05）：远距离传播比例（余下本地播种）。  
+- QD_ECO_MUT_RATE（默认 1e-3）：突变概率（每颗种子）。  
+- QD_ECO_INIT_SPECIES（默认 grass,tree）：初始化基因型集合，逗号分隔。
+
+聚合与短波耦合
+- QD_ECO_LAI_ALBEDO_WEIGHT（默认 1.0）：LAI/叶面积在反照率聚合中的权重。  
+- QD_ECO_ALBEDO_COUPLE（默认 1）：开启生态反照率回写短波带 α。  
+
+诊断与可视化
+- QD_ECO_DIAG（默认 1）：生态诊断打印（EcologyDiag）与可选图层。  
+
+说明
+- 时级接口：PopulationManager.step_subdaily 与 Plant.update_substep 仅累积“当日能量/小时胁迫”，不进行形态大跳转；反照率按缓存策略低频重算（配置见上）。  
+- 日级接口：PopulationManager.step_daily 与 Plant.update_one_day 执行“慢路径”（形态投资、生命周期更替、繁殖/传播/突变）并生成日末诊断。  
+- 反照率耦合：FEEDBACK_MODE=instant 时，时级返回的 A_b^surface 将立即写回短波，下一物理步生效；daily 时仅在日末写回。
+
 # 参考
 
 - P004/005/006/007/008/009/010/011/012/013 项目文档  
