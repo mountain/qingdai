@@ -37,11 +37,14 @@ from pygcm.dynamics import SpectralModel
 from pygcm.topography import create_land_sea_mask, generate_base_properties
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
-from pygcm.jax_compat import is_enabled as JAX_IS_ENABLED
+from pygcm.jax_compat import is_enabled as JAX_IS_ENABLED, backend as JAX_BACKEND
 
 
 def run_benchmark(nlat: int, nlon: int, steps: int, dt: float, with_ocean: bool) -> None:
-    print(f"[Benchmark] Backend: JAX={JAX_IS_ENABLED()} (QD_USE_JAX={int(USE_JAX)}) platform={PLAT}")
+    print(f"[Benchmark] Backend: JAX={JAX_IS_ENABLED()} (QD_USE_JAX={int(USE_JAX)}) platform={PLAT} backend={JAX_BACKEND()}")
+    if JAX_IS_ENABLED() and JAX_BACKEND() in ("cpu", "metal"):
+        print("[Benchmark][Note] JAX backend is cpu/metal; this path is usually slower than pure NumPy for this problem size.")
+        print("  - Recommended: set QD_USE_JAX=0 (pure NumPy), or use Linux+CUDA with jax[cudaXX] for actual GPU speedup.")
     print(f"[Benchmark] Grid: {nlat}x{nlon}, steps={steps}, dt={dt}s, with_ocean={with_ocean}")
     grid = SphericalGrid(n_lat=nlat, n_lon=nlon)
 

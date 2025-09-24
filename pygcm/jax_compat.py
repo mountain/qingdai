@@ -22,6 +22,7 @@ _JAX_ENABLED = False
 _JAX = None
 _JNP = None
 _JAX_SCIPY_NDIMAGE = None
+_JAX_BACKEND = "none"  # cpu|gpu|tpu|metal|unknown|none
 
 try:
     _JAX_ENABLED = int(os.getenv("QD_USE_JAX", "0")) == 1
@@ -33,23 +34,39 @@ if _JAX_ENABLED:
         import jax as _JAX
         import jax.numpy as _JNP
         import jax.scipy.ndimage as _JAX_SCIPY_NDIMAGE
-        # Optional: select platform (cpu|gpu|tpu)
-        plat = os.getenv("QD_JAX_PLATFORM")
-        if plat:
+        # Optional: select platform (cpu|gpu|tpu|metal)
+        plat_env = os.getenv("QD_JAX_PLATFORM")
+        if plat_env:
             # Note: Must be set before JAX backend initialization in real systems;
-            # here we best-effort via environment variable.
-            os.environ.setdefault("JAX_PLATFORM_NAME", plat)
-        _JAX_ENABLED = True
+            os.environ.setdefault("JAX_PLATFORM_NAME", plat_env)
+        # Detect backend after import
+        try:
+            _JAX_BACKEND = _JAX.default_backend() or "unknown"
+        except Exception:
+            _JAX_BACKEND = "unknown"
+        # Gate enablement: only enable by default on CUDA/TPU backends to avoid slowdowns
+        # Allow override with QD_JAX_FORCE=1
+        if _JAX_BACKEND not in ("gpu", "tpu") and os.getenv("QD_JAX_FORCE", "0") != "1":
+            # Disable JAX path; fallback to NumPy/SciPy as default for cpu/metal
+            _JAX_ENABLED = False
+        else:
+            _JAX_ENABLED = True
     except Exception:
         # If import fails, silently disable JAX
         _JAX = None
         _JNP = None
         _JAX_SCIPY_NDIMAGE = None
         _JAX_ENABLED = False
+        _JAX_BACKEND = "none"
 
 
 def is_enabled() -> bool:
     return _JAX_ENABLED
+
+
+def backend() -> str:
+    """Return detected JAX backend string: gpu|cpu|tpu|metal|unknown|none"""
+    return _JAX_BACKEND
 
 
 def to_numpy(x):
