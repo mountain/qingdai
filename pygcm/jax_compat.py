@@ -53,13 +53,22 @@ def is_enabled() -> bool:
 
 
 def to_numpy(x):
-    """Convert JAX array (if enabled) to NumPy array; else return input."""
-    if _JAX_ENABLED:
+    """Convert JAX array (if enabled) to a writeable NumPy array; else return input (as writeable np.ndarray)."""
+    try:
+        if _JAX_ENABLED:
+            arr = _np.asarray(x)
+            # Ensure writeable to avoid in-place op errors (e.g., a *= factor)
+            if not getattr(arr, "flags", None) or not arr.flags.writeable:
+                arr = arr.copy()
+            return arr
+        # Non-JAX path: return np.ndarray (writeable)
+        return x if isinstance(x, _np.ndarray) else _np.array(x, copy=True)
+    except Exception:
+        # Best-effort fallback
         try:
-            return _np.asarray(x)
+            return _np.array(x, copy=True)
         except Exception:
             return x
-    return x
 
 
 def jax_map_coordinates(arr, coords, order: int = 1, mode: str = "wrap", prefilter: bool = False):
