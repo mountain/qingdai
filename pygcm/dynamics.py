@@ -12,6 +12,7 @@ from .grid import SphericalGrid
 from . import constants as const
 from . import energy as energy
 from . import humidity as humidity
+from .jax_compat import is_enabled as _jax_enabled, to_numpy as _to_np, laplacian_sphere as _j_lap, hyperdiffuse as _j_hyp, advect_semilag as _j_adv
 
 class SpectralModel:
     """
@@ -90,28 +91,30 @@ class SpectralModel:
         """
         Advects a scalar field using a semi-Lagrangian scheme with bilinear interpolation.
         """
-        # Calculate departure points
+        # Try JAX path
+        try:
+            if _jax_enabled():
+                coslat = np.maximum(1e-6, np.cos(np.deg2rad(self.grid.lat_mesh)))
+                adv = _j_adv(field, self.u, self.v, dt, self.a, self.dlat_rad, self.dlon_rad, coslat)
+                return _to_np(adv)
+        except Exception:
+            pass
+
+        # Fallback NumPy/SciPy path
         dlon = self.u * dt / (self.a * np.maximum(1e-6, np.cos(np.deg2rad(self.grid.lat_mesh))))
         dlat = self.v * dt / self.a
-        
-        # Convert displacement from radians to grid indices
+
         dx = dlon / self.dlon_rad
         dy = dlat / self.dlat_rad
 
-        # Create coordinate arrays for the grid
         lats = np.arange(self.grid.n_lat)
         lons = np.arange(self.grid.n_lon)
         lon_mesh, lat_mesh = np.meshgrid(lons, lats)
 
-        # Departure points in index space
         dep_lat = lat_mesh - dy
         dep_lon = lon_mesh - dx
 
-        # Interpolate the field at the departure points
-        # 'map_coordinates' requires coordinates in (row, col) format
-        # We use mode='wrap' for longitude to handle periodic boundaries
         advected_field = map_coordinates(field, [dep_lat, dep_lon], order=1, mode='wrap', prefilter=False)
-        
         return advected_field
 
     def _grid_to_spectral(self, data):
@@ -144,20 +147,26 @@ class SpectralModel:
         Uses divergence form with cos(phi) weighting for numerical robustness.
         Longitude is treated as periodic; latitude uses np.gradient one-sided at poles.
         """
+        # Try JAX-jitted kernel
+        try:
+            if _jax_enabled():
+                phi = np.deg2rad(self.grid.lat_mesh)
+                cos = np.maximum(np.cos(phi), 0.2)
+                return _to_np(_j_lap(F, self.dlat_rad, self.dlon_rad, cos, self.a))
+        except Exception:
+            pass
+
+        # NumPy fallback
         a = self.a
         dphi = self.dlat_rad
         dlmb = self.dlon_rad
         phi = np.deg2rad(self.grid.lat_mesh)
-        # Cap cos at 0.2 to avoid polar metric blow-up; pragmatic stabilizer on regular lat-lon grids
         cos = np.maximum(np.cos(phi), 0.2)
-        # Sanitize input to avoid NaN/Inf amplification in derivatives
         F = np.nan_to_num(F, copy=False)
 
-        # Latitude part: (1/cos) * d/dphi ( cos * dF/dphi )
         dF_dphi = np.gradient(F, dphi, axis=0)
         term_phi = (1.0 / cos) * np.gradient(cos * dF_dphi, dphi, axis=0)
 
-        # Longitude part: (1/cos^2) * d2F/dlambda2 with periodic BC
         d2F_dlmb2 = (np.roll(F, -1, axis=1) - 2.0 * F + np.roll(F, 1, axis=1)) / (dlmb ** 2)
         term_lmb = d2F_dlmb2 / (cos ** 2)
 
@@ -169,9 +178,18 @@ class SpectralModel:
         k4 can be a scalar (float) or a 2D map broadcastable to F.
         Implemented as two successive Laplacians. Optionally uses substeps for stability margin.
         """
+        # Try JAX-jitted kernel
+        try:
+            if _jax_enabled():
+                phi = np.deg2rad(self.grid.lat_mesh)
+                cos = np.maximum(np.cos(phi), 0.2)
+                return _to_np(_j_hyp(F, k4, dt, n_substeps, self.dlat_rad, self.dlon_rad, cos, self.a))
+        except Exception:
+            pass
+
         if dt <= 0.0:
             return F
-        # Build k4 array
+        # NumPy fallback
         try:
             import numpy as _np
             if _np.isscalar(k4):

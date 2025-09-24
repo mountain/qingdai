@@ -21,6 +21,7 @@ import numpy as np
 
 from .grid import SphericalGrid
 from . import constants as const
+from .jax_compat import is_enabled as _jax_enabled, to_numpy as _to_np, laplacian_sphere as _j_lap, hyperdiffuse as _j_hyp, advect_semilag as _j_adv
 
 
 class WindDrivenSlabOcean:
@@ -100,6 +101,14 @@ class WindDrivenSlabOcean:
         """
         ∇²F on a regular lat-lon grid using divergence form with cosφ metric.
         """
+        # Try JAX-jitted kernel
+        try:
+            if _jax_enabled():
+                return _to_np(_j_lap(F, self.dlat, self.dlon, self.coslat, self.a))
+        except Exception:
+            pass
+
+        # NumPy fallback
         F = np.nan_to_num(F, copy=False)
         dF_dphi = np.gradient(F, self.dlat, axis=0)
         term_phi = (1.0 / self.coslat) * np.gradient(self.coslat * dF_dphi, self.dlat, axis=0)
@@ -112,9 +121,16 @@ class WindDrivenSlabOcean:
         Explicit ∇⁴ hyperdiffusion with optional substeps for stability.
         k4 can be a scalar (float) or a 2D map broadcastable to F.
         """
+        # Try JAX-jitted kernel
+        try:
+            if _jax_enabled():
+                return _to_np(_j_hyp(F, k4, dt, n_substeps, self.dlat, self.dlon, self.coslat, self.a))
+        except Exception:
+            pass
+
         if dt <= 0.0:
             return F
-        # Build k4 array or scalar
+        # NumPy fallback
         try:
             if np.isscalar(k4):
                 k4_arr = float(k4)
@@ -151,9 +167,16 @@ class WindDrivenSlabOcean:
         """
         Semi-Lagrangian advection (bilinear interpolation, lon periodic).
         """
-        from scipy.ndimage import map_coordinates
+        # Try JAX path
+        try:
+            if _jax_enabled():
+                adv = _j_adv(field, u, v, dt, self.a, self.dlat, self.dlon, self.coslat)
+                return _to_np(adv)
+        except Exception:
+            pass
 
-        # Convert velocities to index displacements
+        # Fallback SciPy path
+        from scipy.ndimage import map_coordinates
         dlam = u * dt / (self.a * self.coslat)   # radians of longitude
         dphi = v * dt / self.a                   # radians of latitude
 

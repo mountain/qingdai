@@ -23,6 +23,7 @@ from pygcm.physics import diagnose_precipitation, diagnose_precipitation_hybrid,
 from pygcm.hydrology import get_hydrology_params_from_env, partition_precip_phase, snow_step, update_land_bucket, diagnose_water_closure
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
+from pygcm.jax_compat import is_enabled as JAX_IS_ENABLED
 
 # --- Restart I/O (NetCDF) and Initialization Helpers ---
 
@@ -485,6 +486,10 @@ def main():
     Main function to run the simulation.
     """
     print("--- Initializing Qingdai GCM ---")
+    try:
+        print(f"[JAX] Acceleration enabled: {JAX_IS_ENABLED()} (toggle via QD_USE_JAX=1; platform via QD_JAX_PLATFORM=cpu|gpu|tpu)")
+    except Exception:
+        pass
 
     # 1. Initialization
     print("Creating grid...")
