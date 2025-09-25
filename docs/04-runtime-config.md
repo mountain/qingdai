@@ -307,6 +307,10 @@ Shapiro 与谱带阻：
 
 诊断与可视化
 - QD_ECO_DIAG（默认 1）：生态诊断打印（EcologyDiag）与可选图层。  
+- QD_ECO_OPEN（默认 1）：macOS 下首次绘图自动打开生态面板（ecology_day_*.png）。  
+- QD_ECO_BANDS_COUPLE（默认 0）：启用带化反照率与短波耦合（日级降维混入）。  
+- QD_ECO_TRUECOLOR_VEG（默认 1）：TrueColor 植被颜色叠加（按带反射与日/夜/I_b 调制）。  
+- QD_ECO_VEG_MIX_EXP（默认 1.3）：TrueColor 叠加时对冠层因子 f(LAI) 的指数强化，提升高 LAI 时的“绿度主导感”。  
 
 说明
 - 时级接口：PopulationManager.step_subdaily 与 Plant.update_substep 仅累积“当日能量/小时胁迫”，不进行形态大跳转；反照率按缓存策略低频重算（配置见上）。  

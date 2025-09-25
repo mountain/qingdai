@@ -364,7 +364,7 @@ def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None, eco=
 
     # Vegetation coloring (optional TrueColor vegetation overlay)
     try:
-        if int(os.getenv("QD_ECO_TRUECOLOR_VEG", "0")) == 1 and eco is not None:
+        if int(os.getenv("QD_ECO_TRUECOLOR_VEG", "1")) == 1 and eco is not None:
             # Canopy factor f(LAI) ∈ [0,1] for land; fallback to 1 where pop is missing
             if getattr(eco, "pop", None) is not None:
                 f_canopy = np.nan_to_num(eco.pop.canopy_reflectance_factor(), nan=0.0)
@@ -413,13 +413,21 @@ def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None, eco=
                 veg_rgb = np.stack([Rr, Rg, Rb], axis=-1)
                 veg_rgb = np.clip(veg_rgb, 0.0, 1.0)
 
-                # Optional gamma shaping for vegetation appearance
+                # Optional saturation/gamma shaping for vegetation appearance
                 try:
-                    gamma = float(os.getenv("QD_ECO_TRUECOLOR_GAMMA", "2.2"))
+                    gamma = float(os.getenv("QD_ECO_TRUECOLOR_GAMMA", "1.8"))
                 except Exception:
-                    gamma = 2.2
+                    gamma = 1.8
                 if gamma > 0:
                     veg_rgb = np.clip(veg_rgb, 0.0, 1.0) ** (1.0 / gamma)
+                # Saturation boost: scale deviation from per-pixel mean
+                try:
+                    sat = float(os.getenv("QD_ECO_TRUECOLOR_SAT", "1.35"))
+                except Exception:
+                    sat = 1.35
+                if sat != 1.0:
+                    m = np.mean(veg_rgb, axis=-1, keepdims=True)
+                    veg_rgb = np.clip(m + sat * (veg_rgb - m), 0.0, 1.0)
 
                 # Mix vegetation with soil on land using canopy factor
                 f = np.clip(f_canopy, 0.0, 1.0)[..., None]
@@ -843,7 +851,7 @@ def main():
         routing = None
 
     # --- Ecology (P015 M1): hourly substep adapter (land-only scalar alpha) ---
-    ECO_ENABLED = int(os.getenv("QD_ECO_ENABLE", "0")) == 1
+    ECO_ENABLED = int(os.getenv("QD_ECO_ENABLE", "1")) == 1
     SUBDAILY_ENABLED = int(os.getenv("QD_ECO_SUBDAILY_ENABLE", "1")) == 1
     eco = None
     # Basic env echo to help users verify switches
@@ -1360,21 +1368,39 @@ def main():
             # Plot instantaneous precipitation rate (kg m^-2 s^-1 ⇒ mm/day)
             plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean, routing=routing)
             plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing, eco=eco)
-            # Ecology simple panel (LAI / scalar alpha / banded alpha if enabled)
+            # Ecology panel: always output (with placeholders if eco is None)
             try:
-                if eco is not None:
-                    lai_map = None
+                lai_map = None
+                if eco is not None and getattr(eco, "pop", None) is not None:
                     try:
-                        lai_map = eco.pop.LAI if (eco.pop is not None) else None
+                        lai_map = eco.pop.LAI
                     except Exception:
                         lai_map = None
-                    band_ok = (int(os.getenv("QD_ECO_BANDS_COUPLE", "0")) == 1)
-                    plot_ecology(
-                        grid, land_mask, t_days, output_dir,
-                        lai=lai_map,
-                        alpha_ecology=last_alpha_ecology_map,
-                        alpha_banded=(last_alpha_banded if band_ok else None)
-                    )
+
+                # Ensure banded alpha available for panel (compute on the fly if not cached)
+                if last_alpha_banded is None and eco is not None:
+                    try:
+                        Abands_now, w_b_now = eco.get_surface_albedo_bands()
+                    except Exception:
+                        Abands_now, w_b_now = (None, None)
+                    if Abands_now is not None and w_b_now is not None:
+                        last_alpha_banded = np.clip(np.nansum(Abands_now * w_b_now[:, None, None], axis=0), 0.0, 1.0)
+                        if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                            print(f"[Ecology] Panel fallback: banded alpha computed from {Abands_now.shape[0]} bands.")
+                band_ok = (last_alpha_banded is not None)
+                plot_ecology(
+                    grid, land_mask, t_days, output_dir,
+                    lai=lai_map,
+                    alpha_ecology=last_alpha_ecology_map,
+                    alpha_banded=(last_alpha_banded if band_ok else None)
+                )
+                # Optional: auto-open ecology panel on macOS at first plot
+                try:
+                    if sys.platform == "darwin" and int(os.getenv("QD_ECO_OPEN", "1")) == 1 and i == 0:
+                        panel_path = os.path.join(output_dir, f"ecology_day_{t_days:05.1f}.png")
+                        os.system(f"open '{panel_path}'")
+                except Exception:
+                    pass
             except Exception as _ev:
                 if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                     print(f"[EcologyViz] skipped: {_ev}")

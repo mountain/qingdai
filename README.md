@@ -104,7 +104,7 @@
   - 运行（与上文相同）：
     - `python3 -m scripts.run_simulation`
 
-参考阅读：
+参考阅读（含生态进展与参数）：
 1.  了解世界观与时间节律：阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)
 2.  轨道与气候模型框架：浏览 [docs/02-orbital-dynamics.md](./docs/02-orbital-dynamics.md) 与 [docs/03-climate-model.md](./docs/03-climate-model.md)
 3.  运行配置与环境变量目录： [docs/04-runtime-config.md](./docs/04-runtime-config.md)

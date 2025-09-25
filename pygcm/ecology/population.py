@@ -60,20 +60,6 @@ class PopulationManager:
             self.K = max(1, int(os.getenv("QD_ECO_COHORT_K", "1")))
         except Exception:
             self.K = 1
-        # Species count
-        try:
-            self.Ns = int(self.species_weights.shape[0])
-        except Exception:
-            self.Ns = 1
-        # LAI_layers_SK shape [S, K, lat, lon]: initialize by species weight×equal split over K
-        self.LAI_layers_SK = np.zeros((self.Ns, self.K, *self.shape), dtype=float)
-        for s in range(self.Ns):
-            frac_s = float(self.species_weights[s]) if self.Ns > 0 else 1.0
-            for k in range(self.K):
-                self.LAI_layers_SK[s, k, :, :] = frac_s * (self.LAI / float(self.K))
-        # Backward-compat aggregated [K,lat,lon]
-        self.LAI_layers = np.sum(self.LAI_layers_SK, axis=0)
-
         # M4: species (genes) mixture support (weights sum to 1, default 1 species)
         # Parsed by adapter to compute banded leaf reflectance; here only store weights.
         species_weights_env = os.getenv("QD_ECO_SPECIES_WEIGHTS", "").strip()
@@ -90,6 +76,22 @@ class PopulationManager:
             self.species_weights = np.asarray([1.0], dtype=float)
         else:
             self.species_weights /= s
+
+        # Species count (after species_weights is defined)
+        try:
+            self.Ns = int(self.species_weights.shape[0])
+        except Exception:
+            self.Ns = 1
+
+        # LAI_layers_SK shape [S, K, lat, lon]: initialize by species weight×equal split over K
+        self.LAI_layers_SK = np.zeros((self.Ns, self.K, *self.shape), dtype=float)
+        for s_idx in range(self.Ns):
+            frac_s = float(self.species_weights[s_idx]) if self.Ns > 0 else 1.0
+            for k in range(self.K):
+                self.LAI_layers_SK[s_idx, k, :, :] = frac_s * (self.LAI / float(self.K))
+        # Backward-compat aggregated [K,lat,lon]
+        self.LAI_layers = np.sum(self.LAI_layers_SK, axis=0)
+
         # Species leaf reflectance cache per band (filled by caller via set_species_reflectance_bands)
         self._species_R_leaf = None  # shape [Ns, NB]
 
