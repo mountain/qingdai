@@ -28,11 +28,22 @@ from pygcm.routing import RiverRouting
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
 from pygcm.jax_compat import is_enabled as JAX_IS_ENABLED
-# Ecology (P015 M1) adapter
+# Ecology (P015 M1) adapter + Phyto (P017)
 try:
-    from pygcm.ecology import EcologyAdapter
+    from pygcm.ecology import EcologyAdapter, PhytoManager
 except Exception:
     EcologyAdapter = None
+    PhytoManager = None
+# Diversity diagnostics (alpha/beta)
+try:
+    from pygcm.ecology import diversity as eco_diversity
+except Exception:
+    eco_diversity = None
+# Vectorized individual pool (subdaily spectral adaptation, sampled cells)
+try:
+    from pygcm.ecology.individuals import IndividualPool
+except Exception:
+    IndividualPool = None
 
 # --- Restart I/O (NetCDF) and Initialization Helpers ---
 
@@ -808,6 +819,39 @@ def plot_ecology(grid, land_mask, t_days, output_dir, *, lai=None, alpha_ecology
         ax.set_title("Species 0 density (proxy)")
         ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.set_xlim(0, 360); ax.set_ylim(-90, 90)
 
+    # --- Beta diversity (Whittaker) annotation on ecology panel ---
+    try:
+        if eco is not None and getattr(eco, "pop", None) is not None and getattr(eco.pop, "LAI_layers_SK", None) is not None:
+            # L_s: per-species canopy mass proxy (Σ_k LAI_s,k) over land
+            L_s = _np.sum(_np.maximum(eco.pop.LAI_layers_SK, 0.0), axis=1)  # [S,lat,lon]
+            land = (land_mask == 1)
+            # Area weights
+            w = _np.maximum(_np.cos(_np.deg2rad(grid.lat_mesh)), 0.0)
+            w_sum_land = float(_np.sum(w[land])) + 1e-15
+            w_norm = w / w_sum_land
+            # Per-pixel alpha diversity (effective species number) α_eff = exp(H), H=−Σ p_i ln p_i
+            tot = _np.sum(L_s, axis=0)  # [lat,lon]
+            alpha_eff = _np.full_like(tot, _np.nan, dtype=float)
+            mask = land & (tot > 0)
+            if _np.any(mask):
+                P = L_s[:, mask] / (tot[mask][None, ...] + 1e-15)  # [S, nmask]
+                H = -_np.sum(P * _np.log(P + 1e-15), axis=0)
+                alpha_eff[mask] = _np.exp(H)
+            alpha_mean = float(_np.nansum(alpha_eff[land] * w_norm[land]))
+            # Gamma diversity: from global composition (area-weighted across land)
+            T_s = _np.array([float(_np.nansum(L_s[s, :, :][land] * w_norm[land])) for s in range(L_s.shape[0])], dtype=float)
+            T_sum = float(_np.sum(T_s)) + 1e-15
+            p_gamma = T_s / T_sum
+            H_gamma = float(-_np.sum(p_gamma * _np.log(p_gamma + 1e-15)))
+            gamma_eff = float(_np.exp(H_gamma))
+            beta_whittaker = float(gamma_eff / max(alpha_mean, 1e-12))
+            # Annotate figure
+            txt = f"Beta diversity (Whittaker): β≈{beta_whittaker:.2f} (ᾱ≈{alpha_mean:.2f}, γ≈{gamma_eff:.2f})"
+            fig.suptitle(txt, fontsize=12)
+    except Exception:
+        # Non-fatal: simply skip annotation
+        pass
+
     fname = os.path.join(output_dir, f"ecology_day_{t_days:05.1f}.png")
     _plt.savefig(fname, dpi=140)
     _plt.close(fig)
@@ -960,6 +1004,56 @@ def main():
     elif ECO_ENABLED:
         print("[Ecology] Adapter not available (import failed).")
 
+    # --- Phytoplankton (P017): daily mixed-layer ocean color coupling ---
+    PHYTO_ENABLED = int(os.getenv("QD_PHYTO_ENABLE", "0")) == 1
+    PHYTO_COUPLE = int(os.getenv("QD_PHYTO_ALBEDO_COUPLE", "1")) == 1
+    PHYTO_FEEDBACK_MODE = os.getenv("QD_PHYTO_FEEDBACK_MODE", "daily").strip().lower()
+    phyto = None
+    if PHYTO_ENABLED and 'PhytoManager' in globals() and PhytoManager is not None:
+        try:
+            try:
+                H_ocean_for_phyto = float(os.getenv("QD_OCEAN_H_M", os.getenv("QD_MLD_M", "50")))
+            except Exception:
+                H_ocean_for_phyto = 50.0
+            phyto = PhytoManager(grid, land_mask, H_mld_m=H_ocean_for_phyto, diag=(int(os.getenv("QD_PHYTO_DIAG", "1")) == 1))
+            if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                print("[Phyto] Manager initialized.")
+        except Exception as e:
+            print(f"[Phyto] Init failed: {e}")
+            phyto = None
+    elif PHYTO_ENABLED:
+        print("[Phyto] Manager not available (import failed).")
+
+    # --- Individual pool settings (vectorized sampled individuals) ---
+    INDIV_ENABLED = int(os.getenv("QD_ECO_INDIV_ENABLE", "0")) == 1
+    indiv = None
+    if INDIV_ENABLED and (eco is not None) and (IndividualPool is not None):
+        try:
+            indiv = IndividualPool(
+                grid,
+                land_mask,
+                eco,
+                # defaults are read inside pool from env as well; passing for clarity
+                sample_frac=float(os.getenv("QD_ECO_INDIV_SAMPLE_FRAC", "0.02")),
+                per_cell=int(os.getenv("QD_ECO_INDIV_PER_CELL", "100")),
+                substeps_per_day=int(os.getenv("QD_ECO_INDIV_SUBSTEPS_PER_DAY", "10")),
+                diag=(int(os.getenv("QD_ECO_DIAG", "1")) == 1),
+            )
+        except Exception as _ie:
+            print(f"[EcoIndiv] init failed: {_ie}")
+            indiv = None
+    elif INDIV_ENABLED and IndividualPool is None:
+        print("[EcoIndiv] Module not available (import failed).")
+
+    # --- Diversity diagnostics settings ---
+    DIVERSITY_ENABLED = int(os.getenv("QD_ECO_DIVERSITY_ENABLE", "0")) == 1
+    try:
+        DIVERSITY_EVERY_DAYS = float(os.getenv("QD_ECO_DIVERSITY_EVERY_DAYS", "10"))
+    except Exception:
+        DIVERSITY_EVERY_DAYS = 10.0
+    if DIVERSITY_ENABLED and eco_diversity is None:
+        print("[Diversity] Module not available (import failed).")
+
     # --- Restart load or banded initialization ---
     restart_in = os.getenv("QD_RESTART_IN")
     if restart_in and os.path.exists(restart_in):
@@ -1102,6 +1196,12 @@ def main():
     last_alpha_ecology_map = None
     last_alpha_banded = None
     alpha_banded_daily = None
+    # Phytoplankton coupling state (P017)
+    ocean_mask = (land_mask == 0)
+    phyto_next_time = 0.0
+    last_alpha_water_scalar = None
+    # Diversity scheduling (in planetary days)
+    diversity_next_day = [0.0]
 
     # 2. Time Integration Loop
     try:
@@ -1151,6 +1251,13 @@ def main():
                     # W_land 单位≈kg/m^2 ≡ mm；归一化后截断到 [0,1]
                     soil_idx = np.clip(W_land / max(1e-6, soil_cap), 0.0, 1.0)
                     eco.step_daily(soil_idx)
+                    # Individual pool daily aggregation -> adjust species splits for sampled cells
+                    if 'indiv' in locals() and indiv is not None:
+                        try:
+                            indiv.step_daily(eco, soil_idx, Ts_map=gcm.T_s, day_length_hours=24.0)
+                        except Exception as _ied:
+                            if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                                print(f"[EcoIndiv] daily step skipped: {_ied}")
                     # Daily banded albedo update (move heavy call to daily boundary)
                     if int(os.getenv("QD_ECO_BANDS_COUPLE", "0")) == 1:
                         try:
@@ -1220,6 +1327,36 @@ def main():
         gcm.isr_A, gcm.isr_B = insA, insB
         gcm.isr = insA + insB
 
+        # 2a) Eco individual pool subdaily step (vectorized) - accumulate per-individual energy/day
+        if 'indiv' in locals() and indiv is not None:
+            try:
+                # Build subdaily soil index proxy from W_land (kg/m^2 ≈ mm) with cap
+                soil_cap_env = os.getenv("QD_ECO_SOIL_WATER_CAP")
+                if soil_cap_env is not None:
+                    try:
+                        soil_cap_sub = float(soil_cap_env)
+                    except Exception:
+                        soil_cap_sub = 50.0
+                else:
+                    soil_cap_sub = 50.0
+                soil_idx_sub = np.clip(W_land / max(1e-6, soil_cap_sub), 0.0, 1.0)
+                indiv.try_substep(gcm.isr_A, gcm.isr_B, eco, soil_idx_sub, dt, day_in_seconds)
+            except Exception as _ies:
+                if int(os.getenv("QD_ECO_DIAG", "1")) == 1 and i == 0:
+                    print(f"[EcoIndiv] substep skipped: {_ies}")
+
+        # P017: Daily phytoplankton step (after ISR available)
+        if phyto is not None and PHYTO_ENABLED:
+            if t >= phyto_next_time:
+                try:
+                    T_w = ocean.Ts if ocean is not None else gcm.T_s
+                    _ab, alpha_scalar = phyto.step_daily(gcm.isr_A, gcm.isr_B, T_w, dt_days=1.0)
+                    last_alpha_water_scalar = alpha_scalar
+                except Exception as _pe:
+                    if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                        print(f"[Phyto] daily step skipped: {_pe}")
+                phyto_next_time = t + day_in_seconds
+
         # 2a) Radiative inputs and sea-ice fraction for albedo synthesis
         H_ice_ref = float(os.getenv("QD_HICE_REF", "0.5"))  # m, e-folding thickness for ice optical effect
         ice_frac = 1.0 - np.exp(-np.maximum(gcm.h_ice, 0.0) / max(1e-6, H_ice_ref))
@@ -1272,6 +1409,15 @@ def main():
                         print(f"[Ecology] bands-couple: alpha_banded(min/mean/max)={np.nanmin(ab):.3f}/{np.nanmean(ab):.3f}/{np.nanmax(ab):.3f}")
                     except Exception:
                         pass
+
+        # Apply phytoplankton ocean-color feedback (override ocean base albedo)
+        if PHYTO_ENABLED and PHYTO_COUPLE and (last_alpha_water_scalar is not None):
+            try:
+                m_o = ocean_mask & np.isfinite(last_alpha_water_scalar)
+                base_input[m_o] = np.clip(last_alpha_water_scalar[m_o], 0.0, 1.0)
+            except Exception as _pc:
+                if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1 and i == 0:
+                    print(f"[Phyto] coupling skipped: {_pc}")
 
         # 2c) Final dynamic albedo (surface base + cloud + ice)
         albedo = calculate_dynamic_albedo(
@@ -1504,6 +1650,17 @@ def main():
 
         # 4. (Optional) Print diagnostics and generate plots
         t_days = t / day_in_seconds
+
+        # Diversity diagnostics (every DIVERSITY_EVERY_DAYS)
+        if 'DIVERSITY_ENABLED' in locals() and DIVERSITY_ENABLED and eco_diversity is not None and eco is not None and getattr(eco, "pop", None) is not None and getattr(eco.pop, "LAI_layers_SK", None) is not None:
+            if t_days >= diversity_next_day[0]:
+                try:
+                    eco_diversity.compute_and_plot(grid, eco, land_mask, t_days, output_dir)
+                    diversity_next_day[0] = t_days + DIVERSITY_EVERY_DAYS
+                except Exception as _de:
+                    if int(os.getenv("QD_ECO_DIAG", "1")) == 1 and i == 0:
+                        print(f"[Diversity] diagnostics skipped: {_de}")
+
         # Update autosave day marker
         current_day[0] = t_days
         if i % 100 == 0 and i > 0:

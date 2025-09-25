@@ -103,9 +103,46 @@ def _generate_L1_continents(grid, seed: int, params: Dict) -> np.ndarray:
     SHAPE_P = float(params.get("CONTINENT_SHAPE_P", 2.0))       # generalized Gaussian exponent
     A_MIN, A_MAX = params.get("CONTINENT_AMP_RANGE", (0.8, 1.2))
 
-    # Sample seed centers: lon ~ U(0, 360), sin(lat) ~ U(-1, 1) for area-uniform sampling
-    cont_lats = np.rad2deg(np.arcsin(rng.uniform(-1.0, 1.0, size=N_CONT)))
-    cont_lons = rng.uniform(0.0, 360.0, size=N_CONT)
+    # Sample seed centers with optional minimum great-circle spacing.
+    # Default: lon ~ U(0, 360), sin(lat) ~ U(-1, 1) (area-uniform).
+    # If CONT_MIN_DIST_DEG > 0, enforce a Poisson-disk-like minimum separation.
+    MIN_DIST_DEG = float(params.get("CONT_MIN_DIST_DEG", 0.0))
+    if MIN_DIST_DEG <= 0.0:
+        cont_lats = np.rad2deg(np.arcsin(rng.uniform(-1.0, 1.0, size=N_CONT)))
+        cont_lons = rng.uniform(0.0, 360.0, size=N_CONT)
+    else:
+        cont_lats_list = []
+        cont_lons_list = []
+        max_tries = 10000
+        tries = 0
+        while len(cont_lats_list) < N_CONT and tries < max_tries:
+            # Candidate sampled area-uniform in latitude
+            lat_cand = np.rad2deg(np.arcsin(rng.uniform(-1.0, 1.0)))
+            lon_cand = rng.uniform(0.0, 360.0)
+            ok = True
+            for la, lo in zip(cont_lats_list, cont_lons_list):
+                # Great-circle distance between (lat_cand, lon_cand) and (la, lo)
+                lat1 = np.deg2rad(lat_cand); lon1 = np.deg2rad(lon_cand)
+                lat2 = np.deg2rad(la);       lon2 = np.deg2rad(lo)
+                cos_d = np.sin(lat1) * np.sin(lat2) + np.cos(lat1) * np.cos(lat2) * np.cos(lon1 - lon2)
+                cos_d = np.clip(cos_d, -1.0, 1.0)
+                d_deg = np.rad2deg(np.arccos(cos_d))
+                if d_deg < MIN_DIST_DEG:
+                    ok = False
+                    break
+            if ok:
+                cont_lats_list.append(lat_cand)
+                cont_lons_list.append(lon_cand)
+            tries += 1
+        if len(cont_lats_list) < N_CONT:
+            # Fallback: fill the remainder without spacing if not enough found
+            n_rem = N_CONT - len(cont_lats_list)
+            extra_lats = np.rad2deg(np.arcsin(rng.uniform(-1.0, 1.0, size=n_rem)))
+            extra_lons = rng.uniform(0.0, 360.0, size=n_rem)
+            cont_lats_list.extend(list(extra_lats))
+            cont_lons_list.extend(list(extra_lons))
+        cont_lats = np.asarray(cont_lats_list[:N_CONT])
+        cont_lons = np.asarray(cont_lons_list[:N_CONT])
     cont_amps = rng.uniform(A_MIN, A_MAX, size=N_CONT)
 
     H_l1 = np.zeros_like(lat_mesh, dtype=float)

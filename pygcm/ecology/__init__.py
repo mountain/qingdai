@@ -11,6 +11,7 @@ from .spectral import (
     default_leaf_reflectance,
 )
 from .types import WeatherInstant, WeatherDaily
+from .phyto import PhytoManager
 
 __all__ = [
     "EcologyAdapter",
@@ -21,4 +22,5 @@ __all__ = [
     "default_leaf_reflectance",
     "WeatherInstant",
     "WeatherDaily",
+    "PhytoManager",
 ]

@@ -9,12 +9,13 @@ Environment variables (optional):
   QD_N_LAT                int   default 181
   QD_N_LON                int   default 360
   QD_SEED                 int   default 42
-  QD_TARGET_LAND_FRAC     float default 0.29
+  QD_TARGET_LAND_FRAC     float default 0.40
 
   # Optional parameter overrides passed to generate_elevation_map:
   QD_N_CONTINENTS         int   default 3
   QD_CONT_SIGMA_DEG       float default 30.0
   QD_CONT_SHAPE_P         float default 2.0
+  QD_CONT_MIN_DIST_DEG    float default 40.0
   QD_W_VLF                float default 0.35
   QD_FBM_OCTAVES          int   default 5
   QD_HURST_H              float default 0.8
@@ -59,13 +60,14 @@ def main():
     n_lat = getenv_int("QD_N_LAT", 181)
     n_lon = getenv_int("QD_N_LON", 360)
     seed = getenv_int("QD_SEED", 42)
-    target_land_frac = getenv_float("QD_TARGET_LAND_FRAC", 0.29)
+    target_land_frac = getenv_float("QD_TARGET_LAND_FRAC", 0.40)
 
     # Elevation param overrides
     params = {
         "N_CONTINENTS": getenv_int("QD_N_CONTINENTS", 3),
         "CONTINENT_SIGMA_DEG": getenv_float("QD_CONT_SIGMA_DEG", 30.0),
         "CONTINENT_SHAPE_P": getenv_float("QD_CONT_SHAPE_P", 2.0),
+        "CONT_MIN_DIST_DEG": getenv_float("QD_CONT_MIN_DIST_DEG", 40.0),
         "W_VLF": getenv_float("QD_W_VLF", 0.35),
         "FBM_OCTAVES": getenv_int("QD_FBM_OCTAVES", 5),
         "HURST_H": getenv_float("QD_HURST_H", 0.8),

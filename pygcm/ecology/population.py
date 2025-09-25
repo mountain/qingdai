@@ -69,11 +69,20 @@ class PopulationManager:
             except Exception:
                 w = [1.0]
         else:
-            w = [1.0]
+            try:
+                ns_default = max(1, int(os.getenv("QD_ECO_NS", "20")))
+            except Exception:
+                ns_default = 20
+            # default to Ns=ns_default equal weights
+            w = [1.0 / float(ns_default)] * ns_default
         s = sum(w) if len(w) > 0 else 1.0
         self.species_weights = np.asarray([max(0.0, wi) for wi in w], dtype=float)
         if s <= 0:
-            self.species_weights = np.asarray([1.0], dtype=float)
+            try:
+                ns_default = max(1, int(os.getenv("QD_ECO_NS", "20")))
+            except Exception:
+                ns_default = 20
+            self.species_weights = np.full((ns_default,), 1.0 / float(ns_default), dtype=float)
         else:
             self.species_weights /= s
 
