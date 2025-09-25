@@ -433,7 +433,7 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
     plt.savefig(filename, dpi=140)
     plt.close(fig)
 
-def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None, eco=None):
+def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None, eco=None, phyto=None):
     """
     Generates and saves a pseudo-true-color plot of the planet.
 
@@ -534,52 +534,74 @@ def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None, eco=
     except Exception:
         pass
 
-    # Lighting/shading by dual-star insolation (make nights black)
+    # Ocean color overlay from phytoplankton (P017)
     try:
-        if int(os.getenv("QD_TRUECOLOR_SHADE", "1")) == 1:
-            # Use total shortwave (W/m^2) as luminance; robust normalization by 95th percentile
-            ins = np.nan_to_num(getattr(gcm, "isr", None))
-            if ins is None or ins.shape != rgb_map[..., 0].shape:
-                ins = np.zeros_like(rgb_map[..., 0])
-            pos = ins[ins > 0.0]
-            if pos.size > 0:
-                p95 = float(np.percentile(pos, 95.0))
-            else:
-                p95 = 1.0
-            p95 = max(p95, 1e-6)
-            try:
-                g_light = float(os.getenv("QD_TRUECOLOR_LIGHT_GAMMA", "0.85"))
-            except Exception:
-                g_light = 0.85
-            shade = np.clip((ins / p95) ** g_light, 0.0, 1.0)[..., None]
-            rgb_map = np.clip(rgb_map * shade, 0.0, 1.0)
+        if int(os.getenv("QD_PLOT_OCEANCOLOR", "1")) == 1 and phyto is not None:
+            alpha_bands, _alpha_scalar = phyto.get_alpha_maps()
+            if alpha_bands is not None:
+                NB = alpha_bands.shape[0]
+                lam = getattr(getattr(phyto, "bands", None), "lambda_centers", None)
+                if lam is None or len(lam) != NB:
+                    lam = np.linspace(420.0, 680.0, NB)
 
-            # Optional: mark subsolar points of both stars
-            if int(os.getenv("QD_TRUECOLOR_MARK_STARS", "1")) == 1:
+                # Channel weights similar to vegetation block
+                def _norm_gauss(x, mu, sigma):
+                    w = np.exp(-((x - mu) ** 2) / (2.0 * sigma ** 2))
+                    s = float(np.sum(w)) + 1e-12
+                    return w / s
+
+                wr = _norm_gauss(lam, 610.0, 50.0)
+                wg = _norm_gauss(lam, 550.0, 40.0)
+                wb = _norm_gauss(lam, 460.0, 40.0)
+
+                # Dynamic per-band irradiance weights where possible
                 try:
-                    idxA = np.unravel_index(np.argmax(getattr(gcm, "isr_A")), gcm.isr_A.shape)
-                    idxB = np.unravel_index(np.argmax(getattr(gcm, "isr_B")), gcm.isr_B.shape)
-                    lonA, latA = grid.lon[idxA[1]], grid.lat[idxA[0]]
-                    lonB, latB = grid.lon[idxB[1]], grid.lat[idxB[0]]
-                    # Draw small bright crosses by directly painting into RGB map neighborhood
-                    def draw_cross(lon, lat, color, half=1):
-                        # find nearest pixel
-                        j = int(np.argmin(np.abs(grid.lat - lat)))
-                        i = int(np.argmin(np.abs(grid.lon - lon)))
-                        for dj in range(-half, half + 1):
-                            jj = np.clip(j + dj, 0, grid.n_lat - 1)
-                            rgb_map[jj, i, :] = color
-                        for di in range(-half, half + 1):
-                            ii = np.clip(i + di, 0, grid.n_lon - 1)
-                            rgb_map[j, ii, :] = color
-                    draw_cross(lonA, latA, np.array([1.0, 0.95, 0.6]), half=1)
-                    draw_cross(lonB, latB, np.array([1.0, 0.85, 0.2]), half=1)
+                    from pygcm.ecology.spectral import dual_star_insolation_to_bands
+                    bands = getattr(phyto, "bands", None)
+                    I_b = dual_star_insolation_to_bands(getattr(gcm, "isr_A", np.zeros_like(gcm.T_s)),
+                                                        getattr(gcm, "isr_B", np.zeros_like(gcm.T_s)),
+                                                        bands) if bands is not None else None
+                    I_tot = np.maximum(getattr(gcm, "isr", np.zeros_like(gcm.T_s)), 0.0)
+                    eps = 1e-12
+                    if I_b is not None:
+                        w_rel = np.zeros_like(I_b)
+                        mask = (I_tot > eps)
+                        if np.any(mask):
+                            w_rel[:, mask] = I_b[:, mask] / (I_tot[mask][None, ...] + eps)
+                    else:
+                        w_rel = np.ones((NB, *gcm.T_s.shape), dtype=float) / float(NB)
                 except Exception:
-                    pass
+                    w_rel = np.ones((NB, *gcm.T_s.shape), dtype=float) / float(NB)
+
+                # Per-channel water reflectance by bands
+                Rr = np.nansum(alpha_bands * (wr[:, None, None] * w_rel), axis=0)
+                Rg = np.nansum(alpha_bands * (wg[:, None, None] * w_rel), axis=0)
+                Rb = np.nansum(alpha_bands * (wb[:, None, None] * w_rel), axis=0)
+                water_rgb = np.stack([Rr, Rg, Rb], axis=-1)
+                water_rgb = np.clip(water_rgb, 0.0, 1.0)
+
+                # Optional shaping
+                try:
+                    gamma = float(os.getenv("QD_OC_GAMMA", os.getenv("QD_ECO_TRUECOLOR_GAMMA", "2.2")))
+                except Exception:
+                    gamma = 2.2
+                if gamma > 0:
+                    water_rgb = np.clip(water_rgb, 0.0, 1.0) ** (1.0 / gamma)
+
+                # Blend factor for overlay
+                try:
+                    blend = float(os.getenv("QD_OC_BLEND", "0.85"))
+                except Exception:
+                    blend = 0.85
+
+                # Apply to open ocean (avoid overwriting sea-ice tiles)
+                ocean_open_mask = (land_mask == 0) & (~sea_ice_mask)
+                rgb_map[ocean_open_mask] = (
+                    rgb_map[ocean_open_mask] * (1.0 - blend) + water_rgb[ocean_open_mask] * blend
+                )
     except Exception:
         pass
 
-    # Optional land snow rendering（默认关闭；如需可由环境变量开启）
     if int(os.getenv("QD_TRUECOLOR_SNOW_BY_TS", "0")) == 1:
         snow_thresh = float(os.getenv("QD_SNOW_THRESH", "273.15"))
         land_snow_mask = (land_mask == 1) & (gcm.T_s <= snow_thresh)
@@ -1005,9 +1027,11 @@ def main():
         print("[Ecology] Adapter not available (import failed).")
 
     # --- Phytoplankton (P017): daily mixed-layer ocean color coupling ---
-    PHYTO_ENABLED = int(os.getenv("QD_PHYTO_ENABLE", "0")) == 1
+    PHYTO_ENABLED = int(os.getenv("QD_PHYTO_ENABLE", "1")) == 1
     PHYTO_COUPLE = int(os.getenv("QD_PHYTO_ALBEDO_COUPLE", "1")) == 1
     PHYTO_FEEDBACK_MODE = os.getenv("QD_PHYTO_FEEDBACK_MODE", "daily").strip().lower()
+    # Enable ocean-current advection for phytoplankton (per-physics-step), default on
+    PHYTO_ADVECTION = int(os.getenv("QD_PHYTO_ADVECTION", "1")) == 1
     phyto = None
     if PHYTO_ENABLED and 'PhytoManager' in globals() and PhytoManager is not None:
         try:
@@ -1024,8 +1048,32 @@ def main():
     elif PHYTO_ENABLED:
         print("[Phyto] Manager not available (import failed).")
 
+    # Load Phyto autosave if present; else initialize by env policy (random/default)
+    try:
+        if phyto is not None and int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1:
+            phy_path = os.path.join("data", "phyto_autosave.npz")
+            on_mismatch = "random" if int(os.getenv("QD_PHYTO_INIT_RANDOM", "0")) == 1 else "default"
+            if os.path.exists(phy_path):
+                ok = phyto.load_autosave(phy_path, on_mismatch=on_mismatch)
+                if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                    print(f"[Phyto] Load autosave {'OK' if ok else 'fallback'} (policy={on_mismatch}).")
+                if not ok:
+                    if on_mismatch == "random":
+                        phyto.randomize_state(seed=None)
+                    else:
+                        phyto.reset_default_state()
+            else:
+                # No autosave file: honor policy
+                if on_mismatch == "random":
+                    phyto.randomize_state(seed=None)
+                else:
+                    phyto.reset_default_state()
+    except Exception as _ple:
+        if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+            print(f"[Phyto] Load/init policy failed: {_ple}")
+
     # --- Individual pool settings (vectorized sampled individuals) ---
-    INDIV_ENABLED = int(os.getenv("QD_ECO_INDIV_ENABLE", "0")) == 1
+    INDIV_ENABLED = int(os.getenv("QD_ECO_INDIV_ENABLE", "1")) == 1
     indiv = None
     if INDIV_ENABLED and (eco is not None) and (IndividualPool is not None):
         try:
@@ -1035,7 +1083,7 @@ def main():
                 eco,
                 # defaults are read inside pool from env as well; passing for clarity
                 sample_frac=float(os.getenv("QD_ECO_INDIV_SAMPLE_FRAC", "0.02")),
-                per_cell=int(os.getenv("QD_ECO_INDIV_PER_CELL", "100")),
+                per_cell=int(os.getenv("QD_ECO_INDIV_PER_CELL", "150")),
                 substeps_per_day=int(os.getenv("QD_ECO_INDIV_SUBSTEPS_PER_DAY", "10")),
                 diag=(int(os.getenv("QD_ECO_DIAG", "1")) == 1),
             )
@@ -1046,7 +1094,7 @@ def main():
         print("[EcoIndiv] Module not available (import failed).")
 
     # --- Diversity diagnostics settings ---
-    DIVERSITY_ENABLED = int(os.getenv("QD_ECO_DIVERSITY_ENABLE", "0")) == 1
+    DIVERSITY_ENABLED = int(os.getenv("QD_ECO_DIVERSITY_ENABLE", "1")) == 1
     try:
         DIVERSITY_EVERY_DAYS = float(os.getenv("QD_ECO_DIVERSITY_EVERY_DAYS", "10"))
     except Exception:
@@ -1077,6 +1125,15 @@ def main():
             # Hydrology
             if rst.get("W_land") is not None: W_land = rst["W_land"]
             if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
+            # Try to load ecology autosave (optional, persists LAI/species weights)
+            if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
+                try:
+                    eco_npz = os.path.join("data", "eco_autosave.npz")
+                    if os.path.exists(eco_npz):
+                        _ = load_eco_autosave(eco, eco_npz)
+                except Exception as _ecl:
+                    if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                        print(f"[Ecology] autosave load skipped: {_ecl}")
             print(f"[Restart] Loaded state from '{restart_in}'.")
         except Exception as e:
             print(f"[Restart] Failed to load '{restart_in}': {e}\nContinuing with fresh init.")
@@ -1196,6 +1253,26 @@ def main():
     last_alpha_ecology_map = None
     last_alpha_banded = None
     alpha_banded_daily = None
+    # Bootstrap ecology alpha at t=0 so first panel is not 'not available'
+    try:
+        if eco is not None:
+            insA0, insB0 = forcing.calculate_insolation_components(0.0)
+            gcm.isr_A, gcm.isr_B = insA0, insB0
+            gcm.isr = insA0 + insB0
+            if SUBDAILY_ENABLED and int(os.getenv("QD_ECO_ALBEDO_COUPLE", "1")) == 1:
+                alpha0 = eco.step_subdaily(gcm.isr, getattr(gcm, "cloud_cover", 0.0), dt)
+                if alpha0 is not None:
+                    last_alpha_ecology_map = alpha0.copy()
+            # Precompute banded alpha once for initial panel if needed
+            try:
+                Ab0, w0 = eco.get_surface_albedo_bands()
+                if Ab0 is not None and w0 is not None:
+                    last_alpha_banded = np.clip(np.nansum(Ab0 * w0[:, None, None], axis=0), 0.0, 1.0)
+                    alpha_banded_daily = last_alpha_banded.copy()
+            except Exception:
+                pass
+    except Exception:
+        pass
     # Phytoplankton coupling state (P017)
     ocean_mask = (land_mask == 0)
     phyto_next_time = 0.0
@@ -1531,6 +1608,14 @@ def main():
                 ocean_open = (land_mask == 0) & (~ice_mask)
                 gcm.T_s = np.where(ocean_open, ocean.Ts, gcm.T_s)
 
+                # P017 M3: Advect phytoplankton by updated ocean currents (optional)
+                if phyto is not None and PHYTO_ENABLED and PHYTO_ADVECTION:
+                    try:
+                        phyto.advect_diffuse(ocean.uo, ocean.vo, dt)
+                    except Exception as _pae:
+                        if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1 and i == 0:
+                            print(f"[Phyto] advection skipped: {_pae}")
+
                 # Optional diagnostics
                 if int(os.getenv("QD_OCEAN_DIAG", "1")) == 1 and (i % 200 == 0):
                     od = ocean.diagnostics()
@@ -1674,7 +1759,7 @@ def main():
         if i % plot_interval_steps == 0:
             # Plot instantaneous precipitation rate (kg m^-2 s^-1 ⇒ mm/day)
             plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean, routing=routing)
-            plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing, eco=eco)
+            plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing, eco=eco, phyto=phyto)
             # Ecology panel: always output (with placeholders if eco is None)
             try:
                 lai_map = None
