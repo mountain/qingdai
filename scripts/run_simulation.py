@@ -8,6 +8,9 @@ import numpy as np
 import sys
 import os
 import matplotlib.pyplot as plt
+import signal
+import atexit
+import json
 
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -105,6 +108,90 @@ def load_restart(path):
                      "uo", "vo", "eta", "Ts", "W_land", "S_snow", "land_mask"]:
             out[name] = rvar(name)
     return out
+
+def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, eco, day_value: float) -> None:
+    """
+    Save autosave checkpoint into data/:
+      - data/restart_autosave.nc   (core model state via NetCDF)
+      - data/eco_autosave.npz      (ecology LAI & species weights, if available)
+      - data/species_autosave.json (light species info: weights; optional)
+    """
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception:
+        pass
+    # Core model state
+    try:
+        autosave_nc = os.path.join(data_dir, "restart_autosave.nc")
+        save_restart(autosave_nc, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow)
+        print(f"[Autosave] Core state saved to '{autosave_nc}'")
+    except Exception as e:
+        print(f"[Autosave] NetCDF save failed: {e}")
+    # Ecology (lightweight)
+    try:
+        if eco is not None and getattr(eco, "pop", None) is not None:
+            # Store total LAI map (land-only meaningful) and species weights
+            path_npz = os.path.join(data_dir, "eco_autosave.npz")
+            LAI_tot = eco.pop.total_LAI() if hasattr(eco.pop, "total_LAI") else getattr(eco.pop, "LAI", None)
+            w = np.asarray(getattr(eco.pop, "species_weights", []), dtype=float)
+            np.savez(path_npz, LAI=LAI_tot, species_weights=w)
+            # Optional light JSON for species info (weights only; genes exported elsewhere)
+            sp_json = os.path.join(data_dir, "species_autosave.json")
+            with open(sp_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"day": float(day_value), "species_weights": w.tolist()},
+                    f, ensure_ascii=False, indent=2
+                )
+            print(f"[Autosave] Ecology state saved to '{path_npz}'")
+    except Exception as e:
+        print(f"[Autosave] Ecology save failed: {e}")
+
+
+def load_eco_autosave(eco, path_npz: str) -> bool:
+    """
+    Load ecology autosave (LAI & species weights) into the running adapter.
+    Rebuilds layered LAI arrays for (S,K,lat,lon) from a total LAI map and species weights.
+    Returns True if loaded successfully.
+    """
+    if eco is None or getattr(eco, "pop", None) is None:
+        return False
+    try:
+        data = np.load(path_npz)
+        LAI = np.asarray(data.get("LAI"))
+        w = np.asarray(data.get("species_weights"))
+        pop = eco.pop
+        # Basic shape check
+        if LAI is None or LAI.shape != pop.shape:
+            return False
+        # Set species weights (normalize if needed)
+        if w is not None and w.size > 0:
+            w = np.clip(w, 0.0, None)
+            s = float(np.sum(w))
+            pop.species_weights = (w / s) if s > 0 else np.full((max(1, w.size),), 1.0 / max(1, w.size), dtype=float)
+            pop.Ns = int(pop.species_weights.shape[0])
+        else:
+            # Fallback single species
+            pop.species_weights = np.asarray([1.0], dtype=float)
+            pop.Ns = 1
+        # Set total LAI and rebuild layered SK tensors by equal split over K and by species weights
+        pop.LAI = np.clip(LAI, 0.0, pop.params.lai_max)
+        K = int(getattr(pop, "K", 1))
+        S = int(getattr(pop, "Ns", 1))
+        H, W = pop.shape
+        pop.LAI_layers_SK = np.zeros((S, K, H, W), dtype=float)
+        for s_idx in range(S):
+            frac_s = float(pop.species_weights[s_idx]) if S > 0 else 1.0
+            for k in range(K):
+                pop.LAI_layers_SK[s_idx, k, :, :] = frac_s * (pop.LAI / float(max(1, K)))
+        pop.LAI_layers = np.sum(pop.LAI_layers_SK, axis=0)
+        if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+            sdiag = pop.summary()
+            print(f"[Ecology] Autosave loaded: LAI(min/mean/max)={sdiag['LAI_min']:.2f}/{sdiag['LAI_mean']:.2f}/{sdiag['LAI_max']:.2f}; S={S}, K={K}")
+        return True
+    except Exception as e:
+        print(f"[Ecology] Autosave load failed: {e}")
+        return False
+
 
 def apply_banded_initial_ts(grid, gcm, ocean, land_mask):
     """
@@ -901,7 +988,36 @@ def main():
             print(f"[Restart] Failed to load '{restart_in}': {e}\nContinuing with fresh init.")
             apply_banded_initial_ts(grid, gcm, ocean, land_mask)
     else:
-        apply_banded_initial_ts(grid, gcm, ocean, land_mask)
+        # Fallback: try autosave checkpoint if enabled
+        autosave_nc = os.path.join("data", "restart_autosave.nc")
+        if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and os.path.exists(autosave_nc):
+            try:
+                rst = load_restart(autosave_nc)
+                if rst.get("u") is not None: gcm.u = rst["u"]
+                if rst.get("v") is not None: gcm.v = rst["v"]
+                if rst.get("h") is not None: gcm.h = rst["h"]
+                if rst.get("T_s") is not None: gcm.T_s = rst["T_s"]
+                if rst.get("cloud_cover") is not None: gcm.cloud_cover = np.clip(rst["cloud_cover"], 0.0, 1.0)
+                if rst.get("q") is not None and hasattr(gcm, "q"): gcm.q = rst["q"]
+                if rst.get("h_ice") is not None and hasattr(gcm, "h_ice"): gcm.h_ice = np.maximum(rst["h_ice"], 0.0)
+                if ocean is not None:
+                    if rst.get("uo") is not None: ocean.uo = rst["uo"]
+                    if rst.get("vo") is not None: ocean.vo = rst["vo"]
+                    if rst.get("eta") is not None: ocean.eta = rst["eta"]
+                    if rst.get("Ts") is not None: ocean.Ts = rst["Ts"]
+                if rst.get("W_land") is not None: W_land = rst["W_land"]
+                if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
+                print(f"[Autosave] Loaded checkpoint from '{autosave_nc}'.")
+            except Exception as e:
+                print(f"[Autosave] Failed to load '{autosave_nc}': {e}\nApplying banded initialization.")
+                apply_banded_initial_ts(grid, gcm, ocean, land_mask)
+        else:
+            apply_banded_initial_ts(grid, gcm, ocean, land_mask)
+        # Try to load ecology autosave (optional)
+        if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
+            eco_npz = os.path.join("data", "eco_autosave.npz")
+            if os.path.exists(eco_npz):
+                _ = load_eco_autosave(eco, eco_npz)
 
     # --- Simulation Parameters ---
     dt = int(os.getenv("QD_DT_SECONDS", "300"))  # default 300s
@@ -934,6 +1050,9 @@ def main():
     output_dir = "output"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
+    # Ensure data/ exists for autosave/restart files
+    data_dir = "data"
+    os.makedirs(data_dir, exist_ok=True)
     
     plot_every_days = float(os.getenv("QD_PLOT_EVERY_DAYS", "10"))
     plot_interval_seconds = plot_every_days * 24 * 3600
@@ -945,6 +1064,35 @@ def main():
     print(f"Time step (dt): {dt} s")
     print(f"Simulation duration: {sim_duration_seconds / day_in_seconds:.1f} planetary days")
     print(f"Total time steps: {len(time_steps)}")
+
+    # --- Autosave hooks (Ctrl-C safe) ---
+    AUTOSAVE_ENABLED = int(os.getenv("QD_AUTOSAVE_ENABLE", "1")) == 1
+    current_day = [0.0]
+
+    def _autosave_hook():
+        try:
+            save_autosave("data", grid, gcm, ocean, land_mask, W_land, S_snow, eco, day_value=current_day[0])
+        except Exception as _ae:
+            print(f"[Autosave] Save failed: {_ae}")
+
+    def _signal_handler(signum, frame):
+        if AUTOSAVE_ENABLED:
+            print(f"[Autosave] Caught signal {signum}, saving checkpoint...")
+            _autosave_hook()
+        # Exit with conventional codes: 130 for SIGINT, 143 for SIGTERM
+        try:
+            import sys as _sys
+            _sys.exit(130 if signum == signal.SIGINT else 143)
+        except SystemExit:
+            raise
+
+    if AUTOSAVE_ENABLED:
+        atexit.register(_autosave_hook)
+        try:
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except Exception:
+            pass
 
     # --- Precipitation accumulation over one planetary day (kg m^-2 ≡ mm/day) ---
     precip_acc_day = np.zeros_like(grid.lat_mesh, dtype=float)
@@ -1356,6 +1504,8 @@ def main():
 
         # 4. (Optional) Print diagnostics and generate plots
         t_days = t / day_in_seconds
+        # Update autosave day marker
+        current_day[0] = t_days
         if i % 100 == 0 and i > 0:
             if not isinstance(iterator, type(time_steps)):
                 iterator.set_description(
