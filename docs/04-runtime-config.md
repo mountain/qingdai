@@ -252,6 +252,7 @@ Shapiro 与谱带阻：
 
 ## 11) 生态模块（P015：Emergent Ecology & Spectral Dynamics）
 
+实现注记（2025‑09‑25）：已接入 M1 小时级适配器（陆地标量 α 回写）；PopulationManager 与日级慢路径待 M2/M3。
 双时序（时级/日级）生态接口，用于植被—辐射即时耦合与日级慢过程（形态投资、生命周期、繁殖/传播）。
 
 主控与步长
@@ -319,3 +320,24 @@ Shapiro 与谱带阻：
 - 主要模块：`pygcm/dynamics.py`、`pygcm/energy.py`、`pygcm/humidity.py`、`pygcm/hydrology.py`、`pygcm/ocean.py`、`pygcm/topography.py`、`pygcm/routing.py`
 
 如需把本目录集成到 README 的“运行 GCM”小节，可在后续提交中将该文档链接加入目录列表。
+
+### P015 M1 快速配置（小时级生态回耦）
+
+当前代码实现了生态模块的小时级子步接口（Sub‑daily），可在每个物理步（dt 秒）按光谱带 I_b(t) 计算植被聚合反照率并即时回写到短波。推荐的最小配置如下（NB=16、每物理步子步、即时回耦）：
+
+```bash
+export QD_ECO_ENABLE=1
+export QD_ECO_SUBDAILY_ENABLE=1
+export QD_ECO_SUBSTEP_EVERY_NPHYS=1     # 每 N 个物理步调用 1 次子步，这里为每步
+export QD_ECO_FEEDBACK_MODE=instant     # 子步立即回写用于下一物理步
+export QD_ECO_ALBEDO_COUPLE=1           # 开启生态反照率回写
+export QD_ECO_SPECTRAL_BANDS=16         # 光谱带数（建议 16）
+# 可选：TOA→Surface 光谱调制
+export QD_ECO_TOA_TO_SURF_MODE=rayleigh
+# 性能与缓存（可选）
+export QD_ECO_LIGHT_UPDATE_EVERY_HOURS=6
+```
+
+说明
+- I_b(t) 由双星入射与瑞利/云调制降维得到；生态返回带反照率 A_b^surface 后按带能量权重降维为标量 α_surface，再与云/海冰在辐射路径中合成最终 albedo。
+- 若仅做日级诊断，设 `QD_ECO_SUBDAILY_ENABLE=0` 且 `QD_ECO_FEEDBACK_MODE=daily`，仅在日末写回。

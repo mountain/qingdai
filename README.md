@@ -92,6 +92,17 @@
   - 运行：
     - `python3 -m scripts.run_simulation`
 
+- 启用生态模块（P015 M1，小时级回耦）：
+  - 最小环境变量（项目当前 M1 约定：NB=16，每物理步子步、即时回耦）
+    - `export QD_ECO_ENABLE=1`
+    - `export QD_ECO_SUBDAILY_ENABLE=1`
+    - `export QD_ECO_SUBSTEP_EVERY_NPHYS=1`      # 每 N 个物理步调用 1 次子步，这里为每步
+    - `export QD_ECO_FEEDBACK_MODE=instant`      # 子步立即回写带反照率用于下一物理步
+    - `export QD_ECO_ALBEDO_COUPLE=1`            # 开启生态反照率回写
+    - `export QD_ECO_SPECTRAL_BANDS=16`          # 光谱带数（建议 16）
+    - （可选）TOA→Surface 光谱调制：`export QD_ECO_TOA_TO_SURF_MODE=rayleigh`
+  - 运行（与上文相同）：
+    - `python3 -m scripts.run_simulation`
 
 参考阅读：
 1.  了解世界观与时间节律：阅读 [docs/01-astronomical-setting.md](./docs/01-astronomical-setting.md)
@@ -106,6 +117,7 @@
 10. 快速自旋与重启（P013）：[docs/11-spin-up-and-restarts.md](./docs/11-spin-up-and-restarts.md)（详见 [projects/013](./projects/013-spin-up.md)）
 11. 开发者指南/代码架构与 API（P002 + 实现）：[docs/12-code-architecture-and-apis.md](./docs/12-code-architecture-and-apis.md)（参见 [projects/002](./projects/002-physics-core.md)）
 12. 地表水文与径流路由（P014）：[projects/014-surface-hydrology.md](./projects/014-surface-hydrology.md)（运行参数见 [docs/04-runtime-config.md](./docs/04-runtime-config.md) 第 10 节）
+13. 项目状态与进展对齐（2025‑09‑25）：[docs/STATUS-2025-09-25.md](./docs/STATUS-2025-09-25.md)
 
 ## 🤝 贡献
 

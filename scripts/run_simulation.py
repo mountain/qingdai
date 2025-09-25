@@ -25,6 +25,11 @@ from pygcm.routing import RiverRouting
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
 from pygcm.jax_compat import is_enabled as JAX_IS_ENABLED
+# Ecology (P015 M1) adapter
+try:
+    from pygcm.ecology import EcologyAdapter
+except Exception:
+    EcologyAdapter = None
 
 # --- Restart I/O (NetCDF) and Initialization Helpers ---
 
@@ -330,7 +335,7 @@ def plot_state(grid, gcm, land_mask, precip, cloud_cover, albedo, t_days, output
     plt.savefig(filename, dpi=140)
     plt.close(fig)
 
-def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None):
+def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None, eco=None):
     """
     Generates and saves a pseudo-true-color plot of the planet.
 
@@ -356,6 +361,117 @@ def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None):
     ice_frac_thresh = float(os.getenv("QD_TRUECOLOR_ICE_FRAC", "0.15"))
     sea_ice_mask = (land_mask == 0) & (ice_frac >= ice_frac_thresh)
     rgb_map[sea_ice_mask] = ice_color
+
+    # Vegetation coloring (optional TrueColor vegetation overlay)
+    try:
+        if int(os.getenv("QD_ECO_TRUECOLOR_VEG", "0")) == 1 and eco is not None:
+            # Canopy factor f(LAI) ∈ [0,1] for land; fallback to 1 where pop is missing
+            if getattr(eco, "pop", None) is not None:
+                f_canopy = np.nan_to_num(eco.pop.canopy_reflectance_factor(), nan=0.0)
+            else:
+                f_canopy = np.zeros_like(gcm.T_s)
+                f_canopy[land_mask == 1] = 1.0
+
+            # Get banded surface albedo A_b^surface (NB×lat×lon); may be from daily cache
+            Abands, _w_b = eco.get_surface_albedo_bands()
+            if Abands is not None:
+                NB = Abands.shape[0]
+                lam = getattr(getattr(eco, "bands", None), "lambda_centers", None)
+                if lam is None or len(lam) != NB:
+                    lam = np.linspace(420.0, 680.0, NB)  # coarse fallback
+
+                # Channel weights (simple Gaussians around canonical wavelengths)
+                def _norm_gauss(x, mu, sigma):
+                    w = np.exp(-((x - mu) ** 2) / (2.0 * sigma ** 2))
+                    s = float(np.sum(w)) + 1e-12
+                    return w / s
+
+                wr = _norm_gauss(lam, 610.0, 50.0)
+                wg = _norm_gauss(lam, 550.0, 40.0)
+                wb = _norm_gauss(lam, 460.0, 40.0)
+
+                # Dynamic per-band irradiance from dual stars → day/night & color modulation
+                try:
+                    from pygcm.ecology.spectral import dual_star_insolation_to_bands
+                    I_b = dual_star_insolation_to_bands(getattr(gcm, "isr_A", np.zeros_like(gcm.T_s)),
+                                                        getattr(gcm, "isr_B", np.zeros_like(gcm.T_s)),
+                                                        eco.bands)  # [NB,lat,lon]
+                    I_tot = np.maximum(getattr(gcm, "isr", np.zeros_like(gcm.T_s)), 0.0)
+                    eps = 1e-12
+                    w_rel = np.zeros_like(I_b)
+                    mask = (I_tot > eps)
+                    if np.any(mask):
+                        w_rel[:, mask] = I_b[:, mask] / (I_tot[mask][None, ...] + eps)
+                except Exception:
+                    # Fallback: flat weights
+                    w_rel = np.ones((NB, *gcm.T_s.shape), dtype=float) / float(NB)
+
+                # Compute per-channel reflected intensity maps by band summation with I_b-relative weights
+                Rr = np.nansum(Abands * (wr[:, None, None] * w_rel), axis=0)
+                Rg = np.nansum(Abands * (wg[:, None, None] * w_rel), axis=0)
+                Rb = np.nansum(Abands * (wb[:, None, None] * w_rel), axis=0)
+                veg_rgb = np.stack([Rr, Rg, Rb], axis=-1)
+                veg_rgb = np.clip(veg_rgb, 0.0, 1.0)
+
+                # Optional gamma shaping for vegetation appearance
+                try:
+                    gamma = float(os.getenv("QD_ECO_TRUECOLOR_GAMMA", "2.2"))
+                except Exception:
+                    gamma = 2.2
+                if gamma > 0:
+                    veg_rgb = np.clip(veg_rgb, 0.0, 1.0) ** (1.0 / gamma)
+
+                # Mix vegetation with soil on land using canopy factor
+                f = np.clip(f_canopy, 0.0, 1.0)[..., None]
+                land3 = (land_mask == 1)[..., None]
+                rgb_map = np.where(land3, rgb_map * (1.0 - f) + veg_rgb * f, rgb_map)
+    except Exception:
+        pass
+
+    # Lighting/shading by dual-star insolation (make nights black)
+    try:
+        if int(os.getenv("QD_TRUECOLOR_SHADE", "1")) == 1:
+            # Use total shortwave (W/m^2) as luminance; robust normalization by 95th percentile
+            ins = np.nan_to_num(getattr(gcm, "isr", None))
+            if ins is None or ins.shape != rgb_map[..., 0].shape:
+                ins = np.zeros_like(rgb_map[..., 0])
+            pos = ins[ins > 0.0]
+            if pos.size > 0:
+                p95 = float(np.percentile(pos, 95.0))
+            else:
+                p95 = 1.0
+            p95 = max(p95, 1e-6)
+            try:
+                g_light = float(os.getenv("QD_TRUECOLOR_LIGHT_GAMMA", "0.85"))
+            except Exception:
+                g_light = 0.85
+            shade = np.clip((ins / p95) ** g_light, 0.0, 1.0)[..., None]
+            rgb_map = np.clip(rgb_map * shade, 0.0, 1.0)
+
+            # Optional: mark subsolar points of both stars
+            if int(os.getenv("QD_TRUECOLOR_MARK_STARS", "1")) == 1:
+                try:
+                    idxA = np.unravel_index(np.argmax(getattr(gcm, "isr_A")), gcm.isr_A.shape)
+                    idxB = np.unravel_index(np.argmax(getattr(gcm, "isr_B")), gcm.isr_B.shape)
+                    lonA, latA = grid.lon[idxA[1]], grid.lat[idxA[0]]
+                    lonB, latB = grid.lon[idxB[1]], grid.lat[idxB[0]]
+                    # Draw small bright crosses by directly painting into RGB map neighborhood
+                    def draw_cross(lon, lat, color, half=1):
+                        # find nearest pixel
+                        j = int(np.argmin(np.abs(grid.lat - lat)))
+                        i = int(np.argmin(np.abs(grid.lon - lon)))
+                        for dj in range(-half, half + 1):
+                            jj = np.clip(j + dj, 0, grid.n_lat - 1)
+                            rgb_map[jj, i, :] = color
+                        for di in range(-half, half + 1):
+                            ii = np.clip(i + di, 0, grid.n_lon - 1)
+                            rgb_map[j, ii, :] = color
+                    draw_cross(lonA, latA, np.array([1.0, 0.95, 0.6]), half=1)
+                    draw_cross(lonB, latB, np.array([1.0, 0.85, 0.2]), half=1)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     # Optional land snow rendering（默认关闭；如需可由环境变量开启）
     if int(os.getenv("QD_TRUECOLOR_SNOW_BY_TS", "0")) == 1:
@@ -526,6 +642,82 @@ def plot_isr_components(grid, gcm, t_days, output_dir):
     plt.close(fig)
 
 
+def plot_ecology(grid, land_mask, t_days, output_dir, *, lai=None, alpha_ecology=None, alpha_banded=None, canopy_height=None, species_density=None):
+    """
+    Save ecology diagnostics:
+    - LAI map
+    - Ecology alpha (scalar) map
+    - Optional banded alpha map
+    - Optional canopy height proxy (m)
+    - Optional species density summary (per species)
+    """
+    import numpy as _np
+    import matplotlib.pyplot as _plt
+
+    have_bands = alpha_banded is not None
+    have_h = canopy_height is not None
+    nspecies = 0 if (species_density is None) else len([m for m in species_density if m is not None])
+    ncols = 3 + (1 if have_h else 0) + (1 if nspecies > 0 else 0)
+    fig, axes = _plt.subplots(1, ncols, figsize=(6.5 * ncols, 5), constrained_layout=True)
+    col = 0
+
+    # 1) LAI
+    ax = axes[col]; col += 1
+    if lai is None:
+        ax.text(0.5, 0.5, "LAI not available", ha="center", va="center")
+    else:
+        cs = ax.contourf(grid.lon, grid.lat, _np.nan_to_num(lai), levels=20, cmap="YlGn")
+        fig.colorbar(cs, ax=ax, label="LAI")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.6)
+    ax.set_title(f"LAI (Day {t_days:.2f})")
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.set_xlim(0, 360); ax.set_ylim(-90, 90)
+
+    # 2) Ecology alpha (scalar)
+    ax = axes[col]; col += 1
+    if alpha_ecology is None:
+        ax.text(0.5, 0.5, "alpha_ecology not available", ha="center", va="center")
+    else:
+        cs = ax.contourf(grid.lon, grid.lat, _np.nan_to_num(alpha_ecology), levels=_np.linspace(0, 0.8, 17), cmap="cividis")
+        fig.colorbar(cs, ax=ax, label="alpha")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.6)
+    ax.set_title("Ecology alpha (scalar)")
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.set_xlim(0, 360); ax.set_ylim(-90, 90)
+
+    # 3) Banded alpha
+    ax = axes[col]; col += 1
+    if not have_bands:
+        ax.text(0.5, 0.5, "alpha_banded not available", ha="center", va="center")
+    else:
+        cs = ax.contourf(grid.lon, grid.lat, _np.nan_to_num(alpha_banded), levels=_np.linspace(0, 0.8, 17), cmap="cividis")
+        fig.colorbar(cs, ax=ax, label="alpha")
+    ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.6)
+    ax.set_title("Ecology alpha (banded)")
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.set_xlim(0, 360); ax.set_ylim(-90, 90)
+
+    # 4) Canopy height
+    if have_h:
+        ax = axes[col]; col += 1
+        cs = ax.contourf(grid.lon, grid.lat, _np.nan_to_num(canopy_height), levels=20, cmap="Greens")
+        fig.colorbar(cs, ax=ax, label="m")
+        ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.6)
+        ax.set_title("Canopy height (m)")
+        ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.set_xlim(0, 360); ax.set_ylim(-90, 90)
+
+    # 5) Species density (first species)
+    if nspecies > 0:
+        ax = axes[col]; col += 1
+        m = species_density[0]
+        cs = ax.contourf(grid.lon, grid.lat, _np.nan_to_num(m), levels=20, cmap="viridis")
+        fig.colorbar(cs, ax=ax, label="arb. units")
+        ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.6)
+        ax.set_title("Species 0 density (proxy)")
+        ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude"); ax.set_xlim(0, 360); ax.set_ylim(-90, 90)
+
+    fname = os.path.join(output_dir, f"ecology_day_{t_days:05.1f}.png")
+    _plt.savefig(fname, dpi=140)
+    _plt.close(fig)
+
+
 def main():
     """
     Main function to run the simulation.
@@ -650,6 +842,29 @@ def main():
         print(f"[HydroRouting] Initialization skipped due to error: {e}")
         routing = None
 
+    # --- Ecology (P015 M1): hourly substep adapter (land-only scalar alpha) ---
+    ECO_ENABLED = int(os.getenv("QD_ECO_ENABLE", "0")) == 1
+    SUBDAILY_ENABLED = int(os.getenv("QD_ECO_SUBDAILY_ENABLE", "1")) == 1
+    eco = None
+    # Basic env echo to help users verify switches
+    try:
+        _nb = os.getenv("QD_ECO_SPECTRAL_BANDS", "default")
+        _mode = os.getenv("QD_ECO_TOA_TO_SURF_MODE", "simple")
+        _use_lai = os.getenv("QD_ECO_USE_LAI", "1")
+        print(f"[Ecology] env: ENABLE={ECO_ENABLED} SUBDAILY={SUBDAILY_ENABLED} NB={_nb} MODE={_mode} USE_LAI={_use_lai}")
+    except Exception:
+        pass
+    if ECO_ENABLED and EcologyAdapter is not None:
+        try:
+            eco = EcologyAdapter(grid, land_mask)
+            if eco is not None and int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                print("[Ecology] Adapter initialized successfully.")
+        except Exception as e:
+            print(f"[Ecology] Adapter init failed: {e}")
+            eco = None
+    elif ECO_ENABLED:
+        print("[Ecology] Adapter not available (import failed).")
+
     # --- Restart load or banded initialization ---
     restart_in = os.getenv("QD_RESTART_IN")
     if restart_in and os.path.exists(restart_in):
@@ -727,6 +942,10 @@ def main():
     precip_acc_day = np.zeros_like(grid.lat_mesh, dtype=float)
     accum_t_day = 0.0
     precip_day_last = None
+    # Ecology viz caches
+    last_alpha_ecology_map = None
+    last_alpha_banded = None
+    alpha_banded_daily = None
 
     # 2. Time Integration Loop
     try:
@@ -761,6 +980,35 @@ def main():
             precip_day_last = precip_acc_day.copy()
             precip_acc_day[:] = 0.0
             accum_t_day -= day_in_seconds
+
+            # --- Ecology M2 daily step: update LAI from soil water proxy ∈[0,1] ---
+            if eco is not None:
+                try:
+                    soil_cap_env = os.getenv("QD_ECO_SOIL_WATER_CAP")
+                    if soil_cap_env is not None:
+                        try:
+                            soil_cap = float(soil_cap_env)
+                        except Exception:
+                            soil_cap = 50.0  # mm ~ kg/m^2
+                    else:
+                        soil_cap = 50.0
+                    # W_land 单位≈kg/m^2 ≡ mm；归一化后截断到 [0,1]
+                    soil_idx = np.clip(W_land / max(1e-6, soil_cap), 0.0, 1.0)
+                    eco.step_daily(soil_idx)
+                    # Daily banded albedo update (move heavy call to daily boundary)
+                    if int(os.getenv("QD_ECO_BANDS_COUPLE", "0")) == 1:
+                        try:
+                            Abands, w_b = eco.get_surface_albedo_bands()
+                        except Exception:
+                            Abands, w_b = (None, None)
+                        if Abands is not None and w_b is not None:
+                            alpha_banded_daily = np.nansum(Abands * w_b[:, None, None], axis=0)
+                            last_alpha_banded = np.clip(alpha_banded_daily, 0.0, 1.0).copy()
+                            if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                                print(f"[Ecology] Daily banded alpha updated from {Abands.shape[0]} bands.")
+                except Exception as _ed:
+                    if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                        print(f"[Ecology] daily step skipped: {_ed}")
         
         # 1b) Convert precipitation to cloud fraction via smooth saturating relation
         if np.any(precip > 0):
@@ -811,31 +1059,116 @@ def main():
 
         gcm.cloud_cover = np.clip(gcm.cloud_cover, 0.0, 1.0)
 
-        # 2) Radiative albedo using updated cloud cover
-        #    Use sea-ice fraction derived from thickness (saturating), consistent with M2 thermodynamics.
-        H_ice_ref = float(os.getenv("QD_HICE_REF", "0.5"))  # m, e-folding thickness for ice optical effect
-        ice_frac = 1.0 - np.exp(-np.maximum(gcm.h_ice, 0.0) / max(1e-6, H_ice_ref))
-        # M4: Use humidity/precipitation-coupled cloud for radiation/albedo if available
-        cloud_for_rad = getattr(gcm, "cloud_eff_last", gcm.cloud_cover)
-
-        if USE_TOPO_ALBEDO:
-            albedo = calculate_dynamic_albedo(
-                cloud_for_rad, gcm.T_s, base_albedo_map, alpha_ice, alpha_cloud, land_mask=land_mask, ice_frac=ice_frac
-            )
-        else:
-            albedo = calculate_dynamic_albedo(
-                cloud_for_rad, gcm.T_s, alpha_water, alpha_ice, alpha_cloud, land_mask=land_mask, ice_frac=ice_frac
-            )
-
-        # 2. Forcing Step
-        # Compute two-star insolation components and diagnostics
+        # 2) Forcing Step (moved earlier for ecology coupling): compute insolation components
         insA, insB = forcing.calculate_insolation_components(t)
         gcm.isr_A, gcm.isr_B = insA, insB
         gcm.isr = insA + insB
+
+        # 2a) Radiative inputs and sea-ice fraction for albedo synthesis
+        H_ice_ref = float(os.getenv("QD_HICE_REF", "0.5"))  # m, e-folding thickness for ice optical effect
+        ice_frac = 1.0 - np.exp(-np.maximum(gcm.h_ice, 0.0) / max(1e-6, H_ice_ref))
+        cloud_for_rad = getattr(gcm, "cloud_eff_last", gcm.cloud_cover)
+
+        # 2b) Ecology M1: land-only scalar surface alpha (optional hourly coupling)
+        base_input = None
+        if USE_TOPO_ALBEDO:
+            base_input = base_albedo_map.copy()
+        else:
+            base_input = np.full_like(gcm.T_s, float(alpha_water))
+
+        if eco is not None and SUBDAILY_ENABLED and int(os.getenv("QD_ECO_ALBEDO_COUPLE", "1")) == 1:
+            try:
+                alpha_map = eco.step_subdaily(gcm.isr, cloud_for_rad, dt)
+            except Exception as _ee:
+                if i == 0:
+                    print(f"[Ecology] subdaily step skipped due to error: {_ee}")
+                alpha_map = None
+            # Decide which alpha to apply this step: new one or last cached
+            if alpha_map is None and last_alpha_ecology_map is not None:
+                alpha_apply = last_alpha_ecology_map
+            else:
+                alpha_apply = alpha_map
+            if alpha_apply is not None:
+                try:
+                    W_LAI = float(os.getenv("QD_ECO_LAI_ALBEDO_WEIGHT", "1.0"))
+                except Exception:
+                    W_LAI = 1.0
+                # Blend ecology alpha into land base albedo
+                land = (land_mask == 1)
+                m = land & np.isfinite(alpha_apply)
+                base_input[m] = (1.0 - W_LAI) * base_input[m] + W_LAI * alpha_apply[m]
+                # cache for viz if new map arrived
+                if alpha_map is not None:
+                    last_alpha_ecology_map = alpha_map.copy()
+                # First-step confirmation
+
+        # 2b.1) M3b（可选）：若启用带化耦合，则用 A_b^surface 做一次加权降维混入 base_input
+        if eco is not None and int(os.getenv("QD_ECO_BANDS_COUPLE", "0")) == 1:
+            # Use daily-cached banded alpha to avoid heavy call every physics step
+            alpha_banded_step = alpha_banded_daily if alpha_banded_daily is not None else last_alpha_banded
+            if alpha_banded_step is not None:
+                land = (land_mask == 1)
+                m2 = land & np.isfinite(alpha_banded_step)
+                base_input[m2] = np.clip(alpha_banded_step[m2], 0.0, 1.0)
+                if i == 0 and int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                    try:
+                        ab = alpha_banded_step[land]
+                        print(f"[Ecology] bands-couple: alpha_banded(min/mean/max)={np.nanmin(ab):.3f}/{np.nanmean(ab):.3f}/{np.nanmax(ab):.3f}")
+                    except Exception:
+                        pass
+
+        # 2c) Final dynamic albedo (surface base + cloud + ice)
+        albedo = calculate_dynamic_albedo(
+            cloud_for_rad, gcm.T_s, base_input, alpha_ice, alpha_cloud, land_mask=land_mask, ice_frac=ice_frac
+        )
+
+        # Global energy budget diagnostic (TOA/SFC/ATM), independent of autotune
+        try:
+            if int(os.getenv("QD_ENERGY_DIAG", "1")) == 1 and (i % 200 == 0):
+                # Shortwave split and reflection with current albedo/cloud
+                SW_atm_dbg, SW_sfc_dbg, R_dbg = energy.shortwave_radiation(gcm.isr, albedo, cloud_for_rad, eparams)
+                # Longwave using chosen scheme
+                g_const = 9.81
+                T_a_dbg = 288.0 + (g_const / 1004.0) * gcm.h
+                use_lw_v2 = int(os.getenv("QD_LW_V2", "1")) == 1
+                if use_lw_v2:
+                    eps_sfc_dbg = energy.surface_emissivity_map(land_mask, ice_frac)
+                    _LW_atm_dbg, LW_sfc_dbg, OLR_dbg, DLR_dbg, _eps_dbg = energy.longwave_radiation_v2(
+                        gcm.T_s, T_a_dbg, cloud_for_rad, eps_sfc_dbg, eparams
+                    )
+                else:
+                    _LW_atm_dbg, LW_sfc_dbg, OLR_dbg, DLR_dbg, _eps_dbg = energy.longwave_radiation(
+                        gcm.T_s, T_a_dbg, cloud_for_rad, eparams
+                    )
+                # SH/LH
+                C_H = float(os.getenv("QD_CH", "1.5e-3"))
+                cp_air = float(os.getenv("QD_CP_A", "1004.0"))
+                rho_air = float(getattr(getattr(gcm, "hum_params", None), "rho_a", 1.2))
+                B_land = float(os.getenv("QD_BOWEN_LAND", "0.7"))
+                B_ocean = float(os.getenv("QD_BOWEN_OCEAN", "0.3"))
+                SH_dbg, _ = energy.boundary_layer_fluxes(
+                    gcm.T_s, T_a_dbg, gcm.u, gcm.v, land_mask,
+                    C_H=C_H, rho=rho_air, c_p=cp_air, B_land=B_land, B_ocean=B_ocean
+                )
+                LH_dbg = getattr(gcm, "LH_last", 0.0)
+                if np.isscalar(LH_dbg):
+                    LH_dbg = np.full_like(gcm.T_s, float(LH_dbg))
+                # Compute and print diagnostics
+                diagE = energy.compute_energy_diagnostics(
+                    grid.lat_mesh, gcm.isr, R_dbg, OLR_dbg, SW_sfc_dbg, LW_sfc_dbg, SH_dbg, LH_dbg
+                )
+                print(f"[EnergyDiag] TOA_net={diagE['TOA_net']:.2f} W/m^2 | "
+                      f"SFC_net={diagE['SFC_net']:.2f} | ATM_net={diagE['ATM_net']:.2f} | "
+                      f"<Ts>={diagE.get('Ts_mean', float(np.nanmean(gcm.T_s))):.2f} K")
+        except Exception as _edbg:
+            if i == 0:
+                print(f"[EnergyDiag] skipped: {_edbg}")
+
+        # 2d) Equilibrium temp with updated albedo
         Teq = forcing.calculate_equilibrium_temp(t, albedo)
 
         # 3. Dynamics Step
-        gcm.time_step(Teq, dt, albedo=albedo)
+        gcm.time_step(Teq, dt)
 
         # 3a. Ocean step (P011): wind-driven currents + SST advection + optional Q_net coupling
         if ocean is not None:
@@ -1026,7 +1359,25 @@ def main():
         if i % plot_interval_steps == 0:
             # Plot instantaneous precipitation rate (kg m^-2 s^-1 ⇒ mm/day)
             plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean, routing=routing)
-            plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing)
+            plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing, eco=eco)
+            # Ecology simple panel (LAI / scalar alpha / banded alpha if enabled)
+            try:
+                if eco is not None:
+                    lai_map = None
+                    try:
+                        lai_map = eco.pop.LAI if (eco.pop is not None) else None
+                    except Exception:
+                        lai_map = None
+                    band_ok = (int(os.getenv("QD_ECO_BANDS_COUPLE", "0")) == 1)
+                    plot_ecology(
+                        grid, land_mask, t_days, output_dir,
+                        lai=lai_map,
+                        alpha_ecology=last_alpha_ecology_map,
+                        alpha_banded=(last_alpha_banded if band_ok else None)
+                    )
+            except Exception as _ev:
+                if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                    print(f"[EcologyViz] skipped: {_ev}")
             # Diagnostics: per-star ISR components (disabled by default; enable with QD_PLOT_ISR=1)
             if PLOT_ISR:
                 plot_isr_components(grid, gcm, t_days, output_dir)

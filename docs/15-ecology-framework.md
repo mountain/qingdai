@@ -4,6 +4,7 @@
 - [x] v1：层次架构（个体—种群—全球）、光/水竞争、繁殖与传播、聚合反照率概念
 - [x] v2：PopulationManager API、每日步序列、光/水竞争算法与带反照率聚合、环境变量与诊断、与 13/14/06/015 的交叉引用
 - [x] v2.1：新增“时级接口（Sub‑daily/Hourly）”与双时序耦合方案（即时反照率回耦 + 日级慢路径）
+- [x] M1：EcologyAdapter 已接入主循环（陆地标量 α 回写；QD_ECO_* 环境变量生效）
 - [ ] M3：参考实现与单元/端到端测试
 - [ ] M4：参数扫描与默认组固化
 
@@ -202,6 +203,54 @@ python3 -m scripts.run_simulation
 - 湿度（文档 08）：蒸腾尚未显式加入；时级路径未来可将“植被覆盖/气孔行为”作为蒸发权重修正
 - 水量（文档 09/14）：生态与路由的耦合可在后续通过“植被调制的蒸发/截留”体现；当前保持最小一致
 - 数值稳定：日末清空个体缓冲；注意单位（E_gain 累积/小时计数）一致性
+
+11. M1 实施与快速开始（小时级回耦）
+
+本节给出当前代码库中“项目 15（M1）小时级生态回耦”的落地用法与数据流，便于立即启用并在不改动其它物理模块的前提下获得“每个物理步的植被—短波耦合”。
+
+11.1 目标与范围（M1）
+- 子步（Sub‑daily/Hourly）：每个物理步（dt 秒）或每 N 个物理步调用一次（QD_ECO_SUBSTEP_EVERY_NPHYS），计算地表光谱带强度 I_b(t) 并由种群聚合带反照率 A_b^surface，降维为标量 α_surface_ecology 后即时回写到短波。
+- 日级（Daily）：在日界触发慢路径（形态投资、生命周期等），M1 可保持极简实现以聚焦回耦链路。
+- 建议配置：NB=16、每物理步子步（N=1）、即时回写（instant）。
+
+11.2 快速开始（推荐 NB=16、每步子步、即时回写）
+```bash
+# 开启生态与小时级子步
+export QD_ECO_ENABLE=1
+export QD_ECO_SUBDAILY_ENABLE=1
+export QD_ECO_SUBSTEP_EVERY_NPHYS=1     # 每 N 个物理步调用 1 次子步，这里为每步
+# 反照率回写策略
+export QD_ECO_FEEDBACK_MODE=instant     # 子步立即回写用于下一物理步
+export QD_ECO_ALBEDO_COUPLE=1           # 开启生态反照率回写
+# 光谱带设置（M1 建议 16）
+export QD_ECO_SPECTRAL_BANDS=16
+# 可选：TOA→Surface 的光谱调制（Rayleigh，简化参数）
+export QD_ECO_TOA_TO_SURF_MODE=rayleigh # simple|rayleigh
+# 可选：降低重算频率以控成本（默认每 6 小时重算冠层/聚合）
+export QD_ECO_LIGHT_UPDATE_EVERY_HOURS=6
+
+python3 -m scripts.run_simulation
+```
+
+11.3 小时级数据流（实施）
+- 输入：gcm.isr（insA+insB），cloud_eff，Ts/Ta 代理、近地风、土壤水指标（由 W_land 归一或代理）。
+- 降维到带：I_b(t) = TOA→surface(I_total, cloud; simple|rayleigh) 按 SpectralBands（NB=16）。
+- 子步：PopulationManager.step_subdaily(weather_inst, dt)
+  1)（可缓存）冠层衰减与分层光竞争，聚合带反照率 A_b^surface
+  2) 若达到回写频率，返回 A_b^surface（NB）；否则返回 None
+- 回写：α_surface_ecology = Σ_b A_b^surface · (I_b/ΣI_b)
+  - 将 α_surface_ecology 融合至陆面 base_albedo_map（权重 QD_ECO_LAI_ALBEDO_WEIGHT），得到 base_albedo_eff
+  - 最终 albedo = calculate_dynamic_albedo(cloud, T_s, base_albedo_eff, α_ice, α_cloud, land_mask, ice_frac)
+- 后续：Forcing.calculate_equilibrium_temp → Dynamics/Ocean/Hydrology 按既有流程推进
+
+11.4 诊断与守恒
+- 能量：保持 TOA/SFC/ATM 长期平均近守恒（阈值 ~2 W·m⁻²）；生态回写仅影响地表短波吸收分配，不应破坏闭合。
+- 性能：通过 QD_ECO_LIGHT_UPDATE_EVERY_HOURS 与 QD_ECO_SUBSTEP_EVERY_NPHYS 控制重算与调用频率；121×240 分辨率下目标额外成本 ≈ 5–10%。
+
+11.5 与其它模块的接口要点
+- 与 docs/06：生态只替换地表“表面基反照率”分量，云与海冰仍由能量/海冰路径合成最终 α_total。
+- 与 docs/08/09：生态当前 M1 不改动 E/P/R 的计算，湿度/水量闭合保持不变。
+- 与 docs/12：生态子包为 pygcm/ecology（spectral/types/plant/population/adapter），主循环通过 EcologyAdapter 接入。
 
 10. 变更记录（Changelog）
 - 2025‑09‑25：v2 → v2.1：新增时级接口（PopulationManager.step_subdaily/WeatherInstant）、子采样与缓存策略、即时反照率回耦、双时序调度与环境变量；与 13/14/06/015 一致化

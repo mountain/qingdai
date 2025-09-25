@@ -168,3 +168,41 @@ scripts/run_simulation.py（主入口）
 - [ ] 无“羽状条纹”；高波数方差比显著下降；大尺度动能保持
 - [ ] 极圈一致化与 sponge 启用；SST/流速无经向条带
 - [ ] 日志包含 topo 来源、海陆比、反照率/摩擦统计、参数快照
+
+## 12.7 生态模块（P015 M1）：子包与接口
+
+包结构补充
+```
+pygcm/
+  └── ecology/
+      ├── __init__.py          # 统一导出 SpectralBands / EcologyAdapter 等
+      ├── spectral.py          # 光谱带定义与 TOA→surface 带强度 I_b 计算
+      ├── types.py             # WeatherInstant/WeatherDaily 等数据结构
+      ├── plant.py             # M1 极简 Plant（固定吸收模板，可后续替换为 Genes/FSM）
+      ├── population.py        # M1 PopulationManager（聚合带反照率、缓存/子采样）
+      └── adapter.py           # EcologyAdapter：连接主循环与生态子步/日步
+```
+
+核心 API（M1）
+- SpectralBands / make_bands(nbands, λ0, λ1)：构造带边界与权重
+- toa_to_surface_bands(I_total, cloud, bands, mode) → I_b[NB]：按 simple/rayleigh 模式将 gcm.isr 分配到各带
+- class PopulationManager.step_subdaily(weather_inst, dt) → Optional[A_b_surface[NB]]：小时级聚合带反照率，按缓存策略低频重算
+- class PopulationManager.step_daily(weather_day) → EcologyDailyReport：日级“慢路径”（M1 可简化）
+- class EcologyAdapter：封装子步/日步的调度、缓存与回写
+
+主循环接入（与 12.4 的顺序一致性）
+1) 降水/云
+2) 计算 insA/insB 与 gcm.isr（Forcing）
+3) Ecology 子步（若开启且到采样频率）：
+   - I_b ← toa_to_surface_bands(gcm.isr, cloud_eff, bands, mode)
+   - A_b^surface ← PopulationManager.step_subdaily(...)
+   - α_surface_ecology = Σ_b A_b^surface · (I_b / Σ I_b)
+   - base_albedo_eff = 将 α_surface_ecology 融合到 base_albedo_map（陆面权重由 QD_ECO_LAI_ALBEDO_WEIGHT 控制）
+4) albedo = calculate_dynamic_albedo(cloud, T_s, base_albedo_eff, α_ice, α_cloud, land_mask, ice_frac)
+5) Teq 与 Dynamics/Ocean/Hydrology（与既有流程一致）
+6) 达到日界时 EcologyAdapter.step_daily(weather_day)
+
+运行控制（与 docs/04 第 11 节一致）
+- QD_ECO_ENABLE=1、QD_ECO_SUBDAILY_ENABLE=1、QD_ECO_SUBSTEP_EVERY_NPHYS=1
+- QD_ECO_FEEDBACK_MODE=instant、QD_ECO_ALBEDO_COUPLE=1
+- QD_ECO_SPECTRAL_BANDS（M1 建议 16）、QD_ECO_TOA_TO_SURF_MODE=rayleigh（可选）

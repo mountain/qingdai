@@ -7,6 +7,9 @@
 - [ ] M3：与 PopulationManager 的端到端联调（见 docs/15）
 - [ ] M4：参数扫描与默认组固化（与项目 015）
 
+实现注记（2025‑09‑25）
+- 代码已提供最小 `Plant`（固定带反射、子步能量累计），当前未在主循环中被调用；小时级反照率回写通过 `EcologyAdapter`（M1）完成，详见 docs/15 与 `scripts/run_simulation.py`。
+
 关联与交叉引用
 - 项目 015（v2）：涌现生态学与光谱演化动力学（projects/015-adaptative-spectral-biogeography.md）
 - 文档 14：适应性光谱物理学（docs/14-adaptive-spectroscopy.md）
