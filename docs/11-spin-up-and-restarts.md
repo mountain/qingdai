@@ -147,6 +147,9 @@ chmod +x spin-up.sh
 - QD_TOTAL_YEARS：按“青黛年”控制时长（优先于 QD_SIM_DAYS）
 - QD_SIM_DAYS：按“青黛日”控制时长
 - QD_PLOT_EVERY_DAYS：出图间隔
+- QD_ORBIT_EPOCH_SECONDS（可选）：仿真起始“天文纪元”t₀（单位：秒）
+- QD_ORBIT_EPOCH_DAYS（可选）：仿真起始“天文纪元”t₀（单位：行星日；与 QD_ORBIT_EPOCH_SECONDS 二选一）
+  - 纪元优先级：若从 QD_RESTART_IN 或 data/restart_autosave.nc 载入且文件内含 t_seconds，则以文件内的 t_seconds 为准（覆盖上述 EPOCH 变量）。当 QD_AUTOSAVE_LOAD=1 且 autosave 存在时脚本会自动续跑。
 
 初值（分带）
 - QD_INIT_BANDED（脚本默认 1；代码默认 0）

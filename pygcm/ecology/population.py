@@ -149,6 +149,8 @@ class PopulationManager:
             self.seedling_lai = 0.02
         # Age map (days since establishment); starts at 0, increments daily where LAI>0
         self.age_days = np.zeros(self.shape, dtype=float)
+        # Spread gating map (e.g., from soil moisture); initialize to land mask
+        self._spread_gate = self.land.astype(float)
 
         # Per-species spread modes (default: species 0 'diffusion' (grass), species 1 'seed' (tree) if present)
         self.species_modes: list[str] = []
@@ -380,6 +382,17 @@ class PopulationManager:
         sen = P.senesce_per_day * P.stress_strength * stress
         sen = np.where(land, sen, 0.0)
 
+        # Build spread gating map from soil (optional) for today's spread step
+        try:
+            if int(os.getenv("QD_ECO_SPREAD_GATE_SOIL", "1")) == 1:
+                exp = float(os.getenv("QD_ECO_SPREAD_SOIL_EXP", "1.0"))
+                gate = np.clip(soil, 0.0, 1.0) ** exp
+                self._spread_gate = np.where(land, gate, 0.0)
+            else:
+                self._spread_gate = self.land.astype(float)
+        except Exception:
+            self._spread_gate = self.land.astype(float)
+
         # Layered Beer-Lambert allocation (top-down) using daily energy proxy
         K = int(getattr(self, "K", 1))
         if K > 1 and getattr(self, "LAI_layers_SK", None) is not None:
@@ -528,14 +541,29 @@ class PopulationManager:
             num_valid = np.zeros((H, W), dtype=float)
             for dy, dx in offsets:
                 num_valid += np.roll(land, shift=(-dy, -dx), axis=(0, 1)).astype(float)
-            outflow = rate * np.maximum(LAI_prev, 0.0) * land.astype(float)
+            gate = getattr(self, "_spread_gate", None)
+            if gate is None:
+                gate = land.astype(float)
+            else:
+                gate = np.where(land, np.clip(gate, 0.0, 1.0), 0.0)
+            outflow = rate * np.maximum(LAI_prev, 0.0) * gate
             with np.errstate(invalid="ignore", divide="ignore"):
                 share = np.where(num_valid > 0.0, outflow / (num_valid + 1e-12), 0.0)
             inflow = np.zeros((H, W), dtype=float)
             for dy, dx in offsets:
                 inflow += np.roll(share, shift=(dy, dx), axis=(0, 1))
             LAI_new = np.full_like(LAI_prev, 0.0)
-            LAI_new[land] = np.clip(LAI_prev[land] - outflow[land] + inflow[land], 0.0, self.params.lai_max)
+            LAI_raw = LAI_prev - outflow + inflow
+            # Cap daily positive increment to avoid runaway front
+            try:
+                dmax = float(os.getenv("QD_ECO_SPREAD_DLAI_MAX", "0.02"))
+            except Exception:
+                dmax = 0.02
+            inc = LAI_raw - LAI_prev
+            inc_pos = np.minimum(np.maximum(inc, 0.0), dmax)
+            dec = np.minimum(inc, 0.0)
+            LAI_capped = LAI_prev + inc_pos + dec
+            LAI_new[land] = np.clip(LAI_capped[land], 0.0, self.params.lai_max)
             if getattr(self, "LAI_layers_SK", None) is not None:
                 LAI_tot_prev = np.maximum(np.sum(self.LAI_layers_SK, axis=(0, 1)), 0.0)
                 with np.errstate(invalid="ignore", divide="ignore"):
@@ -554,14 +582,29 @@ class PopulationManager:
         num_valid = np.zeros((H, W), dtype=float)
         for dy, dx in offsets:
             num_valid += np.roll(land, shift=(-dy, -dx), axis=(0, 1)).astype(float)
-        outflow = rate * LAI_s_prev * land.astype(float)
+        gate = getattr(self, "_spread_gate", None)
+        if gate is None:
+            gate = land.astype(float)
+        else:
+            gate = np.where(land, np.clip(gate, 0.0, 1.0), 0.0)
+        outflow = rate * LAI_s_prev * gate
         with np.errstate(invalid="ignore", divide="ignore"):
             share = np.where(num_valid > 0.0, outflow / (num_valid + 1e-12), 0.0)
         inflow = np.zeros((H, W), dtype=float)
         for dy, dx in offsets:
             inflow += np.roll(share, shift=(dy, dx), axis=(0, 1))
         LAI_s_new = np.full_like(LAI_s_prev, 0.0)
-        LAI_s_new[land] = np.clip(LAI_s_prev[land] - outflow[land] + inflow[land], 0.0, self.params.lai_max)
+        LAI_s_raw = LAI_s_prev - outflow + inflow
+        # Cap daily positive increment for species s
+        try:
+            dmax = float(os.getenv("QD_ECO_SPREAD_DLAI_MAX", "0.02"))
+        except Exception:
+            dmax = 0.02
+        inc = LAI_s_raw - LAI_s_prev
+        inc_pos = np.minimum(np.maximum(inc, 0.0), dmax)
+        dec = np.minimum(inc, 0.0)
+        LAI_s_capped = LAI_s_prev + inc_pos + dec
+        LAI_s_new[land] = np.clip(LAI_s_capped[land], 0.0, self.params.lai_max)
 
         with np.errstate(invalid="ignore", divide="ignore"):
             factor = np.where(LAI_s_prev > 0.0, LAI_s_new / (LAI_s_prev + 1e-12), 0.0)
@@ -621,6 +664,13 @@ class PopulationManager:
 
         # Effective dispersal coefficient
         r_eff = r0 * (1.0 - np.exp(-Seeds / seed_scale))
+        # Optional soil gating of seed dispersal rate
+        gate = getattr(self, "_spread_gate", None)
+        if gate is None:
+            gate = land.astype(float)
+        else:
+            gate = np.where(land, np.clip(gate, 0.0, 1.0), 0.0)
+        r_eff = r_eff * gate
 
         # Count valid land neighbors for each source
         num_valid = np.zeros((H, W), dtype=float)
@@ -635,6 +685,12 @@ class PopulationManager:
         add = np.zeros((H, W), dtype=float)
         for dy, dx in offsets:
             add += s_lai * np.roll(seeds_share, shift=(dy, dx), axis=(0, 1))
+        # Cap seedling LAI daily addition to avoid explosive spread
+        try:
+            dmax_seed = float(os.getenv("QD_ECO_SEED_DLAI_MAX", "0.01"))
+        except Exception:
+            dmax_seed = 0.01
+        add = np.minimum(add, dmax_seed)
 
         # Apply only on land
         seeded_mask = (add > 0.0) & land

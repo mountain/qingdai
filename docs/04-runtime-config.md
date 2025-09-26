@@ -302,7 +302,18 @@ Shapiro 与谱带阻：
 - QD_ECO_SEED_BANK_MAX（默认 1000）：本地种子库容量上限（溢出丢弃或劣化）。  
 - QD_ECO_LONGDIST_FRAC（默认 0.05）：远距离传播比例（余下本地播种）。  
 - QD_ECO_MUT_RATE（默认 1e-3）：突变概率（每颗种子）。  
-- QD_ECO_INIT_SPECIES（默认 grass,tree）：初始化基因型集合，逗号分隔。
+- QD_ECO_INIT_SPECIES（默认 grass,tree）：初始化基因型集合，逗号分隔。  
+- QD_ECO_NS（默认 20）：初始化物种数（未提供 QD_ECO_SPECIES_WEIGHTS 时生效）。  
+- QD_ECO_SPECIES_WEIGHTS：逗号分隔权重列表（归一化后作为物种权重；长度决定 Ns）。  
+- QD_ECO_RAND_SEED：扩散/种子模式随机分配的随机种子（用于可复现实验）。  
+- QD_ECO_SPECIES_{i}_MODE：覆盖第 i 个物种的传播模式（seed|diffusion）。  
+- QD_ECO_SPREAD_ENABLE（0/1，默认 1）：开启植被空间传播。  
+- QD_ECO_SPREAD_RATE（默认 0.03 /day）：扩散/种子传播的基准速率 r0。  
+- QD_ECO_SPREAD_NEIGHBORS（vonNeumann|moore，默认 moore）：邻域类型（4/8 邻）。  
+- QD_ECO_REPRO_FRACTION（默认 0.2）：种子模式繁殖能量比例（E_repro=α·E_day）。  
+- QD_ECO_SEED_ENERGY（默认 1.0 任意单位）：单颗种子能量包，用于 Seeds=E_repro/SEED_ENERGY。  
+- QD_ECO_SEED_SCALE（默认 5.0）：Seeds→r_eff 的尺度，r_eff=r0·(1−exp(−Seeds/SEED_SCALE))。  
+- QD_ECO_SEEDLING_LAI（默认 0.01）：新建植幼苗在落地格的 LAI 增量。
 
 聚合与短波耦合
 - QD_ECO_LAI_ALBEDO_WEIGHT（默认 1.0）：LAI/叶面积在反照率聚合中的权重。  
