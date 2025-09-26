@@ -47,7 +47,7 @@ except Exception:
 
 # --- Restart I/O (NetCDF) and Initialization Helpers ---
 
-def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None):
+def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None, t_seconds: float | None = None):
     """
     Save minimal prognostic state to a NetCDF restart file.
     Includes: lat/lon coords, u/v/h, T_s, cloud_cover, q (if exists), h_ice (if exists),
@@ -95,10 +95,17 @@ def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None):
         # Masks for reference
         wvar("land_mask", land_mask)
 
+        # Optional: astronomical epoch (simulation time in seconds)
+        try:
+            vts = ds.createVariable("t_seconds", "f8")
+            vts[...] = float(t_seconds) if (t_seconds is not None) else 0.0
+        except Exception:
+            pass
+
         # Minimal metadata
         ds.setncattr("title", "Qingdai GCM Restart")
         ds.setncattr("creator", "PyGCM for Qingdai")
-        ds.setncattr("note", "Contains minimal prognostic fields for warm restart.")
+        ds.setncattr("note", "Contains minimal prognostic fields for warm restart (incl. t_seconds).")
         ds.setncattr("format", "v1")
 
 def load_restart(path):
@@ -118,6 +125,11 @@ def load_restart(path):
         for name in ["u", "v", "h", "T_s", "cloud_cover", "q", "h_ice",
                      "uo", "vo", "eta", "Ts", "W_land", "S_snow", "land_mask"]:
             out[name] = rvar(name)
+        # Optional astronomical epoch
+        try:
+            out["t_seconds"] = float(ds.variables["t_seconds"][...])
+        except Exception:
+            out["t_seconds"] = None
     return out
 
 def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, eco, day_value: float) -> None:
@@ -134,7 +146,12 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
     # Core model state
     try:
         autosave_nc = os.path.join(data_dir, "restart_autosave.nc")
-        save_restart(autosave_nc, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow)
+        # Convert current planetary day to seconds for astronomical epoch persistence
+        try:
+            t_sec = float(day_value) * (2 * np.pi / constants.PLANET_OMEGA)
+        except Exception:
+            t_sec = 0.0
+        save_restart(autosave_nc, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow, t_seconds=t_sec)
         print(f"[Autosave] Core state saved to '{autosave_nc}'")
     except Exception as e:
         print(f"[Autosave] NetCDF save failed: {e}")
@@ -1103,6 +1120,7 @@ def main():
         print("[Diversity] Module not available (import failed).")
 
     # --- Restart load or banded initialization ---
+    t0_seconds = 0.0
     restart_in = os.getenv("QD_RESTART_IN")
     if restart_in and os.path.exists(restart_in):
         try:
@@ -1134,6 +1152,13 @@ def main():
                 except Exception as _ecl:
                     if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                         print(f"[Ecology] autosave load skipped: {_ecl}")
+            # Load astronomical epoch if present
+            try:
+                t_loaded = rst.get("t_seconds", None)
+                if t_loaded is not None:
+                    t0_seconds = float(t_loaded)
+            except Exception:
+                pass
             print(f"[Restart] Loaded state from '{restart_in}'.")
         except Exception as e:
             print(f"[Restart] Failed to load '{restart_in}': {e}\nContinuing with fresh init.")
@@ -1159,6 +1184,13 @@ def main():
                 if rst.get("W_land") is not None: W_land = rst["W_land"]
                 if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
                 print(f"[Autosave] Loaded checkpoint from '{autosave_nc}'.")
+                # Load astronomical epoch if present
+                try:
+                    t_loaded = rst.get("t_seconds", None)
+                    if t_loaded is not None:
+                        t0_seconds = float(t_loaded)
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[Autosave] Failed to load '{autosave_nc}': {e}\nApplying banded initialization.")
                 apply_banded_initial_ts(grid, gcm, ocean, land_mask)
@@ -1195,7 +1227,17 @@ def main():
     # Diagnostics toggle: per-star ISR components (disabled by default)
     PLOT_ISR = int(os.getenv("QD_PLOT_ISR", "0")) == 1
     
-    time_steps = np.arange(0, sim_duration_seconds, dt)
+    # Optional epoch override (only if no restart/autosave time was loaded)
+    if t0_seconds == 0.0:
+        try:
+            if os.getenv("QD_ORBIT_EPOCH_SECONDS"):
+                t0_seconds = float(os.getenv("QD_ORBIT_EPOCH_SECONDS"))
+            elif os.getenv("QD_ORBIT_EPOCH_DAYS"):
+                t0_seconds = float(os.getenv("QD_ORBIT_EPOCH_DAYS")) * day_in_seconds
+        except Exception:
+            pass
+
+    time_steps = np.arange(t0_seconds, t0_seconds + sim_duration_seconds, dt)
 
     # --- Visualization Parameters ---
     output_dir = "output"
@@ -1219,6 +1261,11 @@ def main():
     # --- Autosave hooks (Ctrl-C safe) ---
     AUTOSAVE_ENABLED = int(os.getenv("QD_AUTOSAVE_ENABLE", "1")) == 1
     current_day = [0.0]
+    # Initialize autosave day marker from epoch
+    try:
+        current_day[0] = float(time_steps[0]) / day_in_seconds
+    except Exception:
+        current_day[0] = 0.0
 
     def _autosave_hook():
         try:
@@ -1805,7 +1852,11 @@ def main():
     restart_out = os.getenv("QD_RESTART_OUT")
     if restart_out:
         try:
-            save_restart(restart_out, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow)
+            t_sec_final = float(current_day[0]) * day_in_seconds
+        except Exception:
+            t_sec_final = 0.0
+        try:
+            save_restart(restart_out, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow, t_seconds=t_sec_final)
             print(f"[Restart] Saved final state to '{restart_out}'.")
         except Exception as e:
             print(f"[Restart] Failed to save '{restart_out}': {e}")

@@ -28,7 +28,7 @@ M_TOTAL_STARS = M_A + M_B
 A_BINARY = 0.5 * AU  # Semi-major axis of the binary pair
 
 # --- Qingdai Planet Parameters ---
-A_PLANET = 1.6 * AU     # Semi-major axis of the planet's orbit (final, final tuning)
+A_PLANET = 1.32 * AU     # Semi-major axis of the planet's orbit (final, final tuning)
 PLANET_RADIUS = 6.371e6  # Planet radius (m, Earth-like for now)
 PLANET_ALBEDO = 0.3      # Planetary albedo (Earth-like for now)
 PLANET_OMEGA = 8.726646259971648e-5  # Angular velocity (rad/s, for a 20-hour day)

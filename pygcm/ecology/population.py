@@ -63,6 +63,8 @@ class PopulationManager:
         # M4: species (genes) mixture support (weights sum to 1, default 1 species)
         # Parsed by adapter to compute banded leaf reflectance; here only store weights.
         species_weights_env = os.getenv("QD_ECO_SPECIES_WEIGHTS", "").strip()
+        # Track whether weights come from env (affects default spread-mode assignment policy)
+        self._weights_from_env = bool(species_weights_env)
         if species_weights_env:
             try:
                 w = [float(x) for x in species_weights_env.split(",") if x.strip() != ""]
@@ -103,6 +105,129 @@ class PopulationManager:
 
         # Species leaf reflectance cache per band (filled by caller via set_species_reflectance_bands)
         self._species_R_leaf = None  # shape [Ns, NB]
+
+        # --- Spatial spread (colonization) controls (M2.5 minimal) ---
+        # Enable a conservative neighbor-exchange ("diffusion") of LAI over land to emulate
+        # vegetative expansion/propagule dispersal at grid scale.
+        # Env:
+        #   QD_ECO_SPREAD_ENABLE  (0/1, default 0)
+        #   QD_ECO_SPREAD_RATE    (per-day fraction in 0..0.5, default 0.0)
+        #   QD_ECO_SPREAD_NEIGHBORS ('vonNeumann' or 'moore', default 'vonNeumann')
+        try:
+            self.spread_enable = int(os.getenv("QD_ECO_SPREAD_ENABLE", "0")) == 1
+        except Exception:
+            self.spread_enable = False
+        try:
+            self.spread_rate = float(os.getenv("QD_ECO_SPREAD_RATE", "0.0"))
+        except Exception:
+            self.spread_rate = 0.0
+        try:
+            self.spread_neighbors = os.getenv("QD_ECO_SPREAD_NEIGHBORS", "vonNeumann").strip().lower()
+        except Exception:
+            self.spread_neighbors = "vonneumann"
+
+        # Seed-based dispersal parameters (optional, ties speed to seed investment)
+        try:
+            self.spread_mode = os.getenv("QD_ECO_SPREAD_MODE", "diffusion").strip().lower()  # 'diffusion' | 'seed'
+        except Exception:
+            self.spread_mode = "diffusion"
+        try:
+            self.repro_fraction = float(os.getenv("QD_ECO_REPRO_FRACTION", "0.2"))  # fraction of daily energy to reproduction
+        except Exception:
+            self.repro_fraction = 0.2
+        try:
+            self.seed_energy = float(os.getenv("QD_ECO_SEED_ENERGY", "1.0"))  # energy per seed
+        except Exception:
+            self.seed_energy = 1.0
+        try:
+            self.seed_scale = float(os.getenv("QD_ECO_SEED_SCALE", "1.0"))   # scaling in r_eff = r0*(1-exp(-seeds/seed_scale))
+        except Exception:
+            self.seed_scale = 1.0
+        try:
+            self.seedling_lai = float(os.getenv("QD_ECO_SEEDLING_LAI", "0.02"))  # LAI boost per established seed unit
+        except Exception:
+            self.seedling_lai = 0.02
+        # Age map (days since establishment); starts at 0, increments daily where LAI>0
+        self.age_days = np.zeros(self.shape, dtype=float)
+
+        # Per-species spread modes (default: species 0 'diffusion' (grass), species 1 'seed' (tree) if present)
+        self.species_modes: list[str] = []
+        self._init_species_modes()
+
+    def _init_species_modes(self) -> None:
+        """
+        Initialize per-species spread modes with the following policy:
+        - If QD_ECO_SPECIES_{i}_MODE is provided for a species i, honor it.
+        - Else if weights are provided (QD_ECO_SPECIES_WEIGHTS present), draw ONE species index
+          from the given weight distribution to be 'seed' (tree), mark the rest 'diffusion' (grass).
+        - Else (no weights provided), assign each unspecified species independently at random with
+          equal probability to 'seed' or 'diffusion'.
+        A fixed RNG seed can be provided via QD_ECO_RAND_SEED for reproducibility.
+        """
+        try:
+            S = int(getattr(self, "Ns", 1))
+        except Exception:
+            S = 1
+        # Start with any explicit per-species modes from env
+        explicit = []
+        for i in range(S):
+            m = os.getenv(f"QD_ECO_SPECIES_{i}_MODE", "").strip().lower() if os.getenv else ""
+            explicit.append(m if m in ("seed", "diffusion") else "")
+        modes = [""] * S
+        # Fill explicit first
+        for i in range(S):
+            if explicit[i]:
+                modes[i] = explicit[i]
+        # RNG
+        try:
+            seed_val = os.getenv("QD_ECO_RAND_SEED")
+            rng = np.random.default_rng(int(seed_val)) if seed_val not in (None, "",) else np.random.default_rng()
+        except Exception:
+            rng = np.random.default_rng()
+        # Unspecified indices
+        unspec_idx = [i for i in range(S) if modes[i] == ""]
+        if len(unspec_idx) == 0:
+            self.species_modes = modes
+            return
+        # If weights come from env: choose exactly one 'seed' species by weights, rest 'diffusion'
+        weights_from_env = bool(getattr(self, "_weights_from_env", False))
+        if weights_from_env:
+            try:
+                w = np.asarray(getattr(self, "species_weights", np.ones((S,), dtype=float)), dtype=float)
+                w = np.clip(w, 0.0, None)
+                w = w / (np.sum(w) + 1e-12)
+                # Draw one index globally across all species by weights
+                chosen = int(rng.choice(np.arange(S), p=w))
+            except Exception:
+                chosen = 1 if S > 1 else 0
+            for i in unspec_idx:
+                modes[i] = "seed" if i == chosen else "diffusion"
+        else:
+            # No weights from env: assign per-species uniformly at random
+            for i in unspec_idx:
+                modes[i] = "seed" if rng.random() < 0.5 else "diffusion"
+        self.species_modes = modes
+
+    def set_species_modes(self, modes: list[str]) -> None:
+        """
+        Set per-species spread modes; list length should be Ns.
+        Valid entries: 'seed' | 'diffusion'. Missing entries fallback to defaults.
+        """
+        try:
+            S = int(getattr(self, "Ns", 1))
+        except Exception:
+            S = 1
+        out = []
+        for i in range(S):
+            if i < len(modes) and str(modes[i]).lower() in ("seed", "diffusion"):
+                out.append(str(modes[i]).lower())
+            else:
+                # fallback same as init
+                if i == 1:
+                    out.append("seed")
+                else:
+                    out.append("diffusion")
+        self.species_modes = out
 
     def step_subdaily(self, isr_total: np.ndarray, dt_seconds: float) -> None:
         """
@@ -233,8 +358,11 @@ class PopulationManager:
         P = self.params
         land = self.land
 
-        # Growth term from daily energy
-        growth = P.growth_per_j * self.E_day
+        # Growth term from daily energy (split into growth vs reproduction globally by repro_fraction)
+        E_map = self.E_day
+        repro_frac = float(np.clip(getattr(self, "repro_fraction", 0.0), 0.0, 0.95))
+        growth_energy = (1.0 - repro_frac) * np.nan_to_num(E_map)
+        growth = P.growth_per_j * growth_energy
         growth = np.where(land, growth, 0.0)
 
         # Soil water stress term
@@ -322,8 +450,229 @@ class PopulationManager:
             # Fallback single-layer update
             self.LAI = np.clip(self.LAI + growth - sen, 0.0, P.lai_max)
 
+        # Optional spatial spread after growth/senescence
+        seeded_mask = None
+        if getattr(self, "spread_enable", False) and float(getattr(self, "spread_rate", 0.0)) > 0.0:
+            try:
+                S = int(getattr(self, "Ns", 1))
+                modes = getattr(self, "species_modes", [])
+                any_seed = False
+                for s_idx in range(S):
+                    mode_s = (modes[s_idx] if s_idx < len(modes) else ("seed" if s_idx == 1 else "diffusion"))
+                    if mode_s == "seed":
+                        m = self._seed_based_spread_species(s_idx)
+                        if m is not None:
+                            any_seed = True
+                    else:
+                        self._apply_neighbor_spread_species(s_idx, rate=float(getattr(self, "spread_rate", 0.0)))
+                if self._diag and np.random.rand() < 0.05:
+                    sdiag = self.summary()
+                    print(f"[Ecology] per-species spread modes: {modes} | r0={self.spread_rate:.3f}/day | "
+                          f"LAI(min/mean/max)={sdiag['LAI_min']:.2f}/{sdiag['LAI_mean']:.2f}/{sdiag['LAI_max']:.2f}")
+                if any_seed:
+                    # Mark seeded today at cell-level for age reset below
+                    # (approximation: where any species seeded)
+                    seeded_mask = np.zeros(self.shape, dtype=bool)
+                    S = int(getattr(self, "Ns", 1))
+                    # Reconstruct from today's additions: we don't track per-call adds, so fallback to heuristic:
+                    # Use small threshold on today's LAI increase could be implemented; here simply keep non-None flag.
+                    # Keeping seeded_mask as None would skip the age reset special casing; instead, we reset age where total LAI increased.
+                    # As a simple proxy, leave seeded_mask=None and rely on age reset policy below to use inc mask when available.
+                    seeded_mask = None
+            except Exception:
+                pass
+
+        # Age update: increment by 1 day where LAI>0, but keep newly seeded pixels at 0 today
+        try:
+            land_mask = self.land
+            has_lai = (np.maximum(self.total_LAI(), 0.0) > 0.0) & land_mask
+            if seeded_mask is None:
+                self.age_days[has_lai] += 1.0
+            else:
+                inc_mask = has_lai & (~seeded_mask)
+                self.age_days[inc_mask] += 1.0
+        except Exception:
+            pass
+
         # Reset daily energy buffer
         self.E_day[:] = 0.0
+
+    def _apply_neighbor_spread(self) -> None:
+        """
+        Backward-compatible total-LAI diffusion (kept for global mode).
+        """
+        self._apply_neighbor_spread_species(None, rate=float(getattr(self, "spread_rate", 0.0)))
+
+    def _apply_neighbor_spread_species(self, s_idx: int | None, rate: float) -> None:
+        """
+        Per-species conservative neighbor exchange.
+        - If s_idx is None: apply to total LAI (legacy).
+        - Else: apply to species s only, scaling its layers by per-cell factor.
+        """
+        rate = float(max(0.0, min(0.5, rate)))
+        if rate <= 0.0:
+            return
+        land = self.land
+        neigh_mode = str(getattr(self, "spread_neighbors", "vonneumann")).lower()
+        if neigh_mode in ("moore", "8", "8n"):
+            offsets = [(-1,-1), (-1,0), (-1,1),
+                       ( 0,-1),          ( 0,1),
+                       ( 1,-1), ( 1,0),  ( 1,1)]
+        else:
+            offsets = [(-1,0), (0,-1), (0,1), (1,0)]
+
+        if s_idx is None or getattr(self, "LAI_layers_SK", None) is None:
+            # total-LAI path
+            LAI_prev = self.total_LAI()
+            H, W = LAI_prev.shape
+            num_valid = np.zeros((H, W), dtype=float)
+            for dy, dx in offsets:
+                num_valid += np.roll(land, shift=(-dy, -dx), axis=(0, 1)).astype(float)
+            outflow = rate * np.maximum(LAI_prev, 0.0) * land.astype(float)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                share = np.where(num_valid > 0.0, outflow / (num_valid + 1e-12), 0.0)
+            inflow = np.zeros((H, W), dtype=float)
+            for dy, dx in offsets:
+                inflow += np.roll(share, shift=(dy, dx), axis=(0, 1))
+            LAI_new = np.full_like(LAI_prev, 0.0)
+            LAI_new[land] = np.clip(LAI_prev[land] - outflow[land] + inflow[land], 0.0, self.params.lai_max)
+            if getattr(self, "LAI_layers_SK", None) is not None:
+                LAI_tot_prev = np.maximum(np.sum(self.LAI_layers_SK, axis=(0, 1)), 0.0)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    factor = np.where(LAI_tot_prev > 0.0, LAI_new / (LAI_tot_prev + 1e-12), 0.0)
+                self.LAI_layers_SK = np.clip(self.LAI_layers_SK * factor[None, None, :, :], 0.0, self.params.lai_max)
+                self.LAI_layers = np.sum(self.LAI_layers_SK, axis=0)
+                self.LAI = np.sum(self.LAI_layers, axis=0)
+            else:
+                self.LAI = np.clip(LAI_new, 0.0, self.params.lai_max)
+            return
+
+        # species-only path
+        S, K, H, W = self.LAI_layers_SK.shape
+        s = int(np.clip(s_idx, 0, S - 1))
+        LAI_s_prev = np.maximum(np.sum(self.LAI_layers_SK[s, :, :, :], axis=0), 0.0)  # [H,W]
+        num_valid = np.zeros((H, W), dtype=float)
+        for dy, dx in offsets:
+            num_valid += np.roll(land, shift=(-dy, -dx), axis=(0, 1)).astype(float)
+        outflow = rate * LAI_s_prev * land.astype(float)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = np.where(num_valid > 0.0, outflow / (num_valid + 1e-12), 0.0)
+        inflow = np.zeros((H, W), dtype=float)
+        for dy, dx in offsets:
+            inflow += np.roll(share, shift=(dy, dx), axis=(0, 1))
+        LAI_s_new = np.full_like(LAI_s_prev, 0.0)
+        LAI_s_new[land] = np.clip(LAI_s_prev[land] - outflow[land] + inflow[land], 0.0, self.params.lai_max)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            factor = np.where(LAI_s_prev > 0.0, LAI_s_new / (LAI_s_prev + 1e-12), 0.0)
+        # scale only species s layers
+        self.LAI_layers_SK[s, :, :, :] = np.clip(self.LAI_layers_SK[s, :, :, :] * factor[None, :, :], 0.0, self.params.lai_max)
+        # refresh aggregates
+        self.LAI_layers = np.sum(self.LAI_layers_SK, axis=0)
+        self.LAI = np.sum(self.LAI_layers, axis=0)
+
+    def _seed_based_spread(self, soil: np.ndarray | float | None = None) -> np.ndarray | None:
+        """
+        Legacy total-LAI seed-based spread (kept for backward compatibility).
+        """
+        return self._seed_based_spread_species(None)
+
+    def _seed_based_spread_species(self, s_idx: int | None) -> np.ndarray | None:
+        """
+        Per-species seed-based colonization.
+        - If s_idx is None: legacy total-LAI version.
+        - Else: use species' LAI share to apportion reproduction energy and seedling establishment.
+        """
+        r0 = float(max(0.0, min(0.5, getattr(self, "spread_rate", 0.0))))
+        if r0 <= 0.0:
+            return None
+
+        land = self.land
+        H, W = self.shape
+        E_map = np.nan_to_num(self.E_day)
+        repro_frac = float(np.clip(getattr(self, "repro_fraction", 0.0), 0.0, 0.95))
+        seed_energy = float(max(1e-12, getattr(self, "seed_energy", 1.0)))
+        seed_scale = float(max(1e-12, getattr(self, "seed_scale", 1.0)))
+        s_lai = float(max(0.0, getattr(self, "seedling_lai", 0.02)))
+
+        # Neighbor set
+        neigh_mode = str(getattr(self, "spread_neighbors", "vonneumann")).lower()
+        if neigh_mode in ("moore", "8", "8n"):
+            offsets = [(-1,-1), (-1,0), (-1,1),
+                       ( 0,-1),          ( 0,1),
+                       ( 1,-1), ( 1,0),  ( 1,1)]
+        else:
+            offsets = [(-1,0), (0,-1), (0,1), (1,0)]
+
+        # If per-species
+        if s_idx is not None and getattr(self, "LAI_layers_SK", None) is not None:
+            S, K, _, _ = self.LAI_layers_SK.shape
+            s = int(np.clip(s_idx, 0, S - 1))
+            LAI_s = np.maximum(np.sum(self.LAI_layers_SK[s, :, :, :], axis=0), 0.0)
+            LAI_tot = np.maximum(np.sum(self.LAI_layers_SK, axis=(0, 1)), 0.0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                share = np.where(LAI_tot > 0.0, LAI_s / (LAI_tot + 1e-12), 0.0)
+            E_repro_s = repro_frac * E_map * share
+            Seeds = np.maximum(E_repro_s / seed_energy, 0.0) * land.astype(float)
+        else:
+            # Legacy total-LAI
+            E_repro = repro_frac * E_map
+            Seeds = np.maximum(E_repro / seed_energy, 0.0) * land.astype(float)
+
+        # Effective dispersal coefficient
+        r_eff = r0 * (1.0 - np.exp(-Seeds / seed_scale))
+
+        # Count valid land neighbors for each source
+        num_valid = np.zeros((H, W), dtype=float)
+        for dy, dx in offsets:
+            num_valid += np.roll(land, shift=(-dy, -dx), axis=(0, 1)).astype(float)
+
+        # Seeds exported per neighbor
+        with np.errstate(invalid="ignore", divide="ignore"):
+            seeds_share = np.where(num_valid > 0.0, r_eff * Seeds / (num_valid + 1e-12), 0.0)
+
+        # Convert seeds to seedling LAI increments at destination
+        add = np.zeros((H, W), dtype=float)
+        for dy, dx in offsets:
+            add += s_lai * np.roll(seeds_share, shift=(dy, dx), axis=(0, 1))
+
+        # Apply only on land
+        seeded_mask = (add > 0.0) & land
+        if np.any(seeded_mask):
+            if s_idx is not None and getattr(self, "LAI_layers_SK", None) is not None:
+                # Inject seedlings to species s at lowest layer
+                self.LAI_layers_SK[s_idx, 0, seeded_mask] = np.clip(
+                    self.LAI_layers_SK[s_idx, 0, seeded_mask] + add[seeded_mask],
+                    0.0, self.params.lai_max
+                )
+                self.LAI_layers = np.sum(self.LAI_layers_SK, axis=0)
+                self.LAI = np.sum(self.LAI_layers, axis=0)
+            else:
+                # Legacy: distribute to species by weights in k=0
+                if getattr(self, "LAI_layers_SK", None) is not None:
+                    try:
+                        S = int(self.Ns)
+                        w = np.asarray(self.species_weights, dtype=float)
+                        w = w / (np.sum(w) + 1e-12)
+                    except Exception:
+                        S = 1
+                        w = np.asarray([1.0], dtype=float)
+                    for s in range(S):
+                        self.LAI_layers_SK[s, 0, seeded_mask] = np.clip(
+                            self.LAI_layers_SK[s, 0, seeded_mask] + w[s] * add[seeded_mask],
+                            0.0, self.params.lai_max
+                        )
+                    self.LAI_layers = np.sum(self.LAI_layers_SK, axis=0)
+                    self.LAI = np.sum(self.LAI_layers, axis=0)
+                else:
+                    self.LAI[seeded_mask] = np.clip(self.LAI[seeded_mask] + add[seeded_mask], 0.0, self.params.lai_max)
+            # Reset age to 0 at newly seeded cells
+            try:
+                self.age_days[seeded_mask] = 0.0
+            except Exception:
+                pass
+
+        return seeded_mask if np.any(seeded_mask) else None
 
     def canopy_reflectance_factor(self) -> np.ndarray:
         """

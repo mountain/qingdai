@@ -254,3 +254,57 @@ python3 -m scripts.run_simulation
 
 10. 变更记录（Changelog）
 - 2025‑09‑25：v2 → v2.1：新增时级接口（PopulationManager.step_subdaily/WeatherInstant）、子采样与缓存策略、即时反照率回耦、双时序调度与环境变量；与 13/14/06/015 一致化
+
+附录（新增 2025‑09‑26）：物种数 Ns 与“草/树”传播模式默认策略
+为便于快速实验“草（扩散）/树（种子）”的格局演化，PopulationManager 增加了物种级传播模式初始化逻辑与相关环境变量。默认策略如下：
+
+A) 物种数 Ns 与权重
+- Ns 的确定优先级：
+  1) 若提供 QD_ECO_SPECIES_WEIGHTS（逗号分隔浮点），其长度即为 Ns，值将归一化为权重；
+  2) 否则使用 QD_ECO_NS（整数，默认 20）设定 Ns，并以均匀权重初始化（1/Ns）。
+- 注意：若启用 autosave（data/eco_autosave.npz 且 QD_AUTOSAVE_LOAD=1），会优先从 autosave 恢复 Ns/权重/LAI，覆盖上述初始化；如需使用新的初始化策略，删除 autosave 或设置 QD_AUTOSAVE_LOAD=0。
+
+B) 传播模式（per‑species）默认分配
+- 可显式覆盖任一物种：QD_ECO_SPECIES_{i}_MODE=seed|diffusion（优先级最高）。
+- 若“未提供权重”（即未设置 QD_ECO_SPECIES_WEIGHTS）且某物种未显式设置模式：
+  - 按 50/50 独立均匀随机为该物种分配 seed 或 diffusion；
+  - 可用 QD_ECO_RAND_SEED 指定整数随机种子以获得可复现的模式分配。
+- 若“提供了权重”（QD_ECO_SPECIES_WEIGHTS 存在）且某些物种未显式设置模式：
+  - 按权重分布在所有物种中“抽取恰好 1 个”为 seed（树），其余未指定者为 diffusion（草）。
+  - 任何物种都可通过 QD_ECO_SPECIES_{i}_MODE 显式改写上述结果。
+- 运行期，传播按“每物种”执行：
+  - diffusion：守恒的邻域交换（vonNeumann 4 邻或 moore 8 邻）模拟匍匐/营养繁殖外扩；
+  - seed：扩张速度由种子投资门控：E_day → E_repro=REPRO_FRACTION·E_day，Seeds=E_repro/SEED_ENERGY，
+    r_eff = r0 · (1 − exp(−Seeds/SEED_SCALE))，向邻格播撒并以 SEEDLING_LAI 折算为 LAI；建植成功处 age_days 置 0。
+
+C) 相关环境变量（补充清单）
+- 物种与权重
+  - QD_ECO_SPECIES_WEIGHTS：逗号分隔权重，长度决定 Ns（提供则覆盖 QD_ECO_NS）
+  - QD_ECO_NS：物种数（未提供权重时生效；默认 20）
+  - QD_ECO_RAND_SEED：初始化时的随机种子（整数，可复现随机分配）
+  - QD_ECO_SPECIES_{i}_MODE：覆盖第 i 个物种的传播模式（seed|diffusion）
+- 传播（扩散/种子）
+  - QD_ECO_SPREAD_ENABLE（0/1）：开启空间传播
+  - QD_ECO_SPREAD_RATE=r0（0..0.5 / day）：传播基准速率
+  - QD_ECO_SPREAD_NEIGHBORS=vonNeumann|moore：邻域类型（4/8 邻）
+  - QD_ECO_REPRO_FRACTION（0..0.95）：繁殖能量比例（seed 模式用）
+  - QD_ECO_SEED_ENERGY：每颗种子能量
+  - QD_ECO_SEED_SCALE：Seeds→r_eff 的尺度
+  - QD_ECO_SEEDLING_LAI：幼苗建植 LAI 增量
+
+D) 最小示例
+- 默认 20 物种、未给权重（随机 50/50）：
+  export QD_AUTOSAVE_LOAD=0
+  export QD_ECO_SPREAD_ENABLE=1
+  export QD_ECO_SPREAD_RATE=0.03
+  export QD_ECO_RAND_SEED=12345
+  python3 -m scripts.run_simulation
+- 提供权重（示例 Ns=5），从权重中抽 1 个为 seed，其余 diffusion：
+  export QD_AUTOSAVE_LOAD=0
+  export QD_ECO_SPECIES_WEIGHTS=0.3,0.05,0.15,0.1,0.4
+  export QD_ECO_SPREAD_ENABLE=1
+  export QD_ECO_SPREAD_RATE=0.03
+  python3 -m scripts.run_simulation
+- 显式覆盖个别物种：
+  export QD_ECO_SPECIES_0_MODE=seed
+  export QD_ECO_SPECIES_1_MODE=diffusion

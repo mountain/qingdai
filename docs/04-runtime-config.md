@@ -25,7 +25,10 @@
 - QD_SIM_DAYS（可选）整段运行时长，单位：行星日（不设置则走 QD_TOTAL_YEARS 或默认 5 年）  
 - QD_TOTAL_YEARS（推荐）整段运行时长，单位：行星年；优先于 QD_SIM_DAYS  
 - QD_PLOT_EVERY_DAYS（默认 10）出图间隔（行星日），减少 I/O 可适当调大  
-- QD_TS_MIN / QD_TS_MAX（默认 150/340 K）表面温度钳制（可视化/数值保护）
+- QD_TS_MIN / QD_TS_MAX（默认 150/340 K）表面温度钳制（可视化/数值保护）  
+- QD_ORBIT_EPOCH_SECONDS（可选）仿真起始“天文纪元”t₀（秒）；若提供则从该秒开始时间积分  
+- QD_ORBIT_EPOCH_DAYS（可选）仿真起始“天文纪元”t₀（按行星日）；与 QD_ORBIT_EPOCH_SECONDS 二选一  
+  - 说明：当从 restart_autosave.nc 或显式 QD_RESTART_IN 载入时，若文件内含 t_seconds，则优先生效（覆盖上述 EPOCH 变量）。当 QD_AUTOSAVE_LOAD=1 且 data/restart_autosave.nc 存在时，脚本会自动读取其中的 t_seconds 作为继续仿真的纪元。
 
 动力学（浅水动量）选择：
 - QD_MOM_SCHEME（默认 geos）  
