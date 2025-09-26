@@ -1,36 +1,27 @@
-import numpy as np
-import matplotlib.pyplot as plt
+import sys
 import os
 
-# --- Font Setup for CJK characters ---
-def setup_cjk_font():
-    try:
-        plt.rcParams['font.family'] = 'SimHei'
-        plt.rcParams['axes.unicode_minus'] = False # To handle minus sign correctly
-        print("Font 'SimHei' is set for plotting.")
-    except Exception as e:
-        print(f"Could not set font to SimHei: {e}")
-        print("Please install a CJK font (e.g., SimHei) for better plot display.")
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-setup_cjk_font()
+import numpy as np
+import matplotlib.pyplot as plt
+
+import pygcm.constants as c
 
 # --- 1. 定义常量与参数 ---
 # (Copied from docs/02-orbital-dynamics.md)
-G = 6.67430e-11      # 引力常量 (m^3 kg^-1 s^-2)
-M_SUN = 1.989e30     # 太阳质量 (kg)
-L_SUN = 3.828e26     # 太阳光度 (W)
-AU = 1.496e11        # 天文单位 (m)
-
-# 参考值
-SOLAR_CONSTANT = 1361 # 地球接收的太阳常数 (W/m^2)
+G = c.G      # 引力常量 (m^3 kg^-1 s^-2)
+M_SUN = c.M_SUN     # 太阳质量 (kg)
+L_SUN = c.L_SUN     # 太阳光度 (W)
+AU = c.AU        # 天文单位 (m)
 
 # 系统参数 (源自 01-astronomical-setting.md)
-M_A = 1.0 * M_SUN    # 主星质量
-M_B = 0.8 * M_SUN    # 伴星质量
-L_A = 1.0 * L_SUN    # 主星光度
-L_B = 0.4 * L_SUN    # 伴星光度
-a_bin = 0.5 * AU     # 双星轨道半长轴
-a_p = 1.5 * AU       # 青黛行星轨道半长轴
+M_A = c.M_A    # 主星质量
+M_B = c.M_B    # 伴星质量
+L_A = c.L_A    # 主星光度
+L_B = c.L_B    # 伴星光度
+a_bin = c.A_BINARY   # 双星轨道半长轴
+a_p = c.A_PLANET     # 青黛行星轨道半长轴
 
 # --- 2. 计算轨道周期 (基于开普勒第三定律) ---
 M_total = M_A + M_B
