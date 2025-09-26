@@ -26,11 +26,12 @@ Environment variables (optional):
 Usage:
   python scripts/generate_topography.py
 """
-import os
 import sys
-from datetime import datetime
+import os
 
-import numpy as np
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from datetime import datetime
 
 from pygcm.grid import SphericalGrid
 from pygcm.topography import (
