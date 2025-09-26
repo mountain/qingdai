@@ -108,6 +108,41 @@ def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None, t_
         ds.setncattr("note", "Contains minimal prognostic fields for warm restart (incl. t_seconds).")
         ds.setncattr("format", "v1")
 
+def save_topography(path, grid, land_mask, base_albedo_map, friction_map, elevation=None):
+    """
+    Write standardized topography file:
+      - path: data/topography.nc
+      - variables: lat, lon, land_mask (u1), base_albedo (f4), friction (f4), optional elevation (f4)
+    """
+    from netCDF4 import Dataset
+    import numpy as _np
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with Dataset(path, "w") as ds:
+        nlat, nlon = grid.n_lat, grid.n_lon
+        ds.createDimension("lat", nlat)
+        ds.createDimension("lon", nlon)
+        vlat = ds.createVariable("lat", "f4", ("lat",))
+        vlon = ds.createVariable("lon", "f4", ("lon",))
+        vlat[:] = grid.lat.astype(_np.float32)
+        vlon[:] = grid.lon.astype(_np.float32)
+
+        vmask = ds.createVariable("land_mask", "u1", ("lat", "lon"))
+        vmask[:] = _np.asarray(land_mask, dtype=_np.uint8)
+
+        vba = ds.createVariable("base_albedo", "f4", ("lat", "lon"))
+        vba[:] = _np.asarray(base_albedo_map, dtype=_np.float32)
+
+        vfr = ds.createVariable("friction", "f4", ("lat", "lon"))
+        vfr[:] = _np.asarray(friction_map, dtype=_np.float32)
+
+        if elevation is not None:
+            vel = ds.createVariable("elevation", "f4", ("lat", "lon"))
+            vel[:] = _np.asarray(elevation, dtype=_np.float32)
+
+        ds.setncattr("title", "Qingdai Topography")
+        ds.setncattr("source", "scripts/run_simulation.py")
+        ds.setncattr("format", "v1")
+
 def load_restart(path):
     """
     Load restart file and return a dict of arrays. Missing variables are returned as None.
@@ -132,6 +167,69 @@ def load_restart(path):
             out["t_seconds"] = None
     return out
 
+def save_ocean(path: str, grid, ocean, day_value: float | None = None) -> bool:
+    """
+    Write standardized ocean physical state to data/ocean.nc:
+      - lat, lon
+      - uo, vo (m/s), eta (m), Ts (K)
+      - attributes: day (planetary), title/source
+    """
+    try:
+        from netCDF4 import Dataset
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with Dataset(path, "w") as ds:
+            nlat, nlon = grid.n_lat, grid.n_lon
+            ds.createDimension("lat", nlat)
+            ds.createDimension("lon", nlon)
+            vlat = ds.createVariable("lat", "f4", ("lat",))
+            vlon = ds.createVariable("lon", "f4", ("lon",))
+            vlat[:] = grid.lat
+            vlon[:] = grid.lon
+
+            def wvar(name, data):
+                var = ds.createVariable(name, "f4", ("lat", "lon"))
+                var[:] = np.asarray(data, dtype=np.float32)
+
+            if getattr(ocean, "uo", None) is not None: wvar("uo", ocean.uo)
+            if getattr(ocean, "vo", None) is not None: wvar("vo", ocean.vo)
+            if getattr(ocean, "eta", None) is not None: wvar("eta", ocean.eta)
+            if getattr(ocean, "Ts", None) is not None: wvar("Ts", ocean.Ts)
+
+            ds.setncattr("title", "Qingdai Ocean State")
+            ds.setncattr("source", "scripts/run_simulation.py")
+            if day_value is not None:
+                ds.setncattr("day", float(day_value))
+        return True
+    except Exception as e:
+        print(f"[Ocean] Save failed: {e}")
+        return False
+
+def load_ocean(path: str) -> dict:
+    """
+    Load ocean physical state from ocean.nc. Returns dict with keys uo, vo, eta, Ts, day(optional).
+    Missing variables are None.
+    """
+    out = {"uo": None, "vo": None, "eta": None, "Ts": None, "day": None}
+    try:
+        from netCDF4 import Dataset
+        with Dataset(path, "r") as ds:
+            def r(name):
+                try:
+                    return ds.variables[name][:].data
+                except Exception:
+                    return None
+            out["uo"] = r("uo")
+            out["vo"] = r("vo")
+            out["eta"] = r("eta")
+            out["Ts"] = r("Ts")
+            try:
+                out["day"] = float(ds.getncattr("day"))
+            except Exception:
+                out["day"] = None
+    except Exception as e:
+        print(f"[Ocean] Load failed '{path}': {e}")
+    return out
+
 def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, eco, day_value: float) -> None:
     """
     Save autosave checkpoint into data/:
@@ -145,14 +243,14 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
         pass
     # Core model state
     try:
-        autosave_nc = os.path.join(data_dir, "restart_autosave.nc")
+        autosave_nc = os.path.join(data_dir, "atmosphere.nc")
         # Convert current planetary day to seconds for astronomical epoch persistence
         try:
             t_sec = float(day_value) * (2 * np.pi / constants.PLANET_OMEGA)
         except Exception:
             t_sec = 0.0
         save_restart(autosave_nc, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow, t_seconds=t_sec)
-        print(f"[Autosave] Core state saved to '{autosave_nc}'")
+        print(f"[Autosave] Core state saved to '{autosave_nc}' (standardized atmosphere.nc)")
     except Exception as e:
         print(f"[Autosave] NetCDF save failed: {e}")
     # Ecology (extended if possible, fallback to legacy)
@@ -160,7 +258,7 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
         if eco is not None and getattr(eco, "pop", None) is not None:
             # Resolve autosave path (allow override by env)
             path_env = os.getenv("QD_ECO_AUTOSAVE_PATH")
-            path_npz = path_env if path_env else os.path.join(data_dir, "eco_autosave.npz")
+            path_npz = path_env if path_env else os.path.join(data_dir, "ecology.nc")
             # Ensure directory exists for custom path
             try:
                 os.makedirs(os.path.dirname(path_npz) or ".", exist_ok=True)
@@ -190,10 +288,10 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
                         )
                 except Exception:
                     pass
-            # Also write stable genes_autosave.json under data/ (best-effort)
+            # Also write standardized genes.json alongside ecology state (best-effort)
             try:
                 if hasattr(eco, "save_genes_json"):
-                    eco.save_genes_json(os.path.join(data_dir, "genes_autosave.json"), day_value=float(day_value))
+                    eco.save_genes_json(os.path.join(data_dir, "genes.json"), day_value=float(day_value))
             except Exception:
                 pass
     except Exception as e:
@@ -1026,6 +1124,12 @@ def main():
         print(f"[Topo] Procedural topography (no external NetCDF). Land fraction: {achieved:.3f}")
         print(f"[Topo] Albedo stats (min/mean/max): {np.min(base_albedo_map):.3f}/{np.mean(base_albedo_map):.3f}/{np.max(base_albedo_map):.3f}")
         print(f"[Topo] Friction stats (min/mean/max): {np.min(friction_map):.2e}/{np.mean(friction_map):.2e}/{np.max(friction_map):.2e}")
+    # Write standardized topography.nc (always)
+    try:
+        save_topography(os.path.join("data", "topography.nc"), grid, land_mask, base_albedo_map, friction_map, elevation=elevation)
+        print("[Topo] Wrote standardized topography.nc")
+    except Exception as _tw:
+        print(f"[Topo] topography.nc write skipped: {_tw}")
 
     # --- Slab Ocean (P007 M1): construct per-grid surface heat capacity map ---
     # C_s_ocean = rho_w * c_p_w * H_mld; land uses smaller constant C_s_land
@@ -1097,7 +1201,7 @@ def main():
     routing = None
     try:
         HYDRO_ENABLED = (int(os.getenv("QD_HYDRO_ENABLE", "1")) == 1)
-        hydro_net = os.getenv("QD_HYDRO_NETCDF", "data/hydrology_network.nc")
+        hydro_net = os.getenv("QD_HYDRO_NETCDF", "data/hydrology.nc")
         if HYDRO_ENABLED:
             # If network file missing, attempt auto-generation once
             if not (hydro_net and os.path.exists(hydro_net)):
@@ -1191,6 +1295,32 @@ def main():
         if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
             print(f"[Phyto] Load/init policy failed: {_ple}")
 
+    # Optional: load plankton bio/distribution on startup (controlled by QD_LOAD_PLANKTON=1)
+    try:
+        if phyto is not None and int(os.getenv("QD_LOAD_PLANKTON", "1")) == 1:
+            # Bio/optics (JSON)
+            try:
+                pj = os.path.join("data", "plankton.json")
+                if os.path.exists(pj):
+                    ok_bio = phyto.load_bio_json(pj, on_mismatch=os.getenv("QD_PLANKTON_BIO_ON_MISMATCH", "keep"))
+                    if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                        print(f"[Phyto] plankton.json load {'OK' if ok_bio else 'skipped/failed'}.")
+            except Exception as _plj:
+                if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                    print(f"[Phyto] plankton.json load skipped: {_plj}")
+            # Distributions (NetCDF)
+            try:
+                pnc = os.path.join("data", "plankton.nc")
+                if os.path.exists(pnc):
+                    ok_nc = phyto.load_distribution_nc(pnc, on_mismatch=os.getenv("QD_PLANKTON_DIST_ON_MISMATCH", "keep"))
+                    if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                        print(f"[Phyto] plankton.nc load {'OK' if ok_nc else 'skipped/failed'}.")
+            except Exception as _pln:
+                if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                    print(f"[Phyto] plankton.nc load skipped: {_pln}")
+    except Exception:
+        pass
+
     # --- Individual pool settings (vectorized sampled individuals) ---
     INDIV_ENABLED = int(os.getenv("QD_ECO_INDIV_ENABLE", "1")) == 1
     indiv = None
@@ -1248,7 +1378,7 @@ def main():
             # Load genes autosave JSON (if present) before LAI/species weights
             if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
                 try:
-                    genes_path = os.getenv("QD_ECO_GENES_JSON_PATH") or os.path.join("data", "genes_autosave.json")
+                    genes_path = os.getenv("QD_ECO_GENES_JSON_PATH") or os.path.join("data", "genes.json")
                     if os.path.exists(genes_path) and hasattr(eco, "load_genes_json"):
                         eco.load_genes_json(genes_path)
                 except Exception as _egl:
@@ -1257,7 +1387,7 @@ def main():
             # Try to load ecology autosave (optional, persists LAI/species weights)
             if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
                 try:
-                    eco_npz = os.path.join("data", "eco_autosave.npz")
+                    eco_npz = os.path.join("data", "ecology.nc")
                     if os.path.exists(eco_npz):
                         _ = load_eco_autosave(eco, eco_npz)
                 except Exception as _ecl:
@@ -1271,12 +1401,25 @@ def main():
             except Exception:
                 pass
             print(f"[Restart] Loaded state from '{restart_in}'.")
+            # Optionally load standardized ocean.nc to override ocean fields
+            try:
+                if ocean is not None and int(os.getenv("QD_LOAD_OCEAN", "1")) == 1:
+                    ocean_nc = os.path.join("data", "ocean.nc")
+                    if os.path.exists(ocean_nc):
+                        rst_o = load_ocean(ocean_nc)
+                        if rst_o.get("uo") is not None: ocean.uo = rst_o["uo"]
+                        if rst_o.get("vo") is not None: ocean.vo = rst_o["vo"]
+                        if rst_o.get("eta") is not None: ocean.eta = rst_o["eta"]
+                        if rst_o.get("Ts") is not None: ocean.Ts = rst_o["Ts"]
+                        print("[Restart] Ocean state overridden from 'data/ocean.nc'.")
+            except Exception as _loe:
+                print(f"[Restart] ocean.nc load skipped: {_loe}")
         except Exception as e:
             print(f"[Restart] Failed to load '{restart_in}': {e}\nContinuing with fresh init.")
             apply_banded_initial_ts(grid, gcm, ocean, land_mask)
     else:
         # Fallback: try autosave checkpoint if enabled
-        autosave_nc = os.path.join("data", "restart_autosave.nc")
+        autosave_nc = os.path.join("data", "atmosphere.nc")
         if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and os.path.exists(autosave_nc):
             try:
                 rst = load_restart(autosave_nc)
@@ -1295,6 +1438,19 @@ def main():
                 if rst.get("W_land") is not None: W_land = rst["W_land"]
                 if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
                 print(f"[Autosave] Loaded checkpoint from '{autosave_nc}'.")
+                # Optionally load standardized ocean.nc to override ocean fields
+                try:
+                    if ocean is not None and int(os.getenv("QD_LOAD_OCEAN", "1")) == 1:
+                        ocean_nc = os.path.join("data", "ocean.nc")
+                        if os.path.exists(ocean_nc):
+                            rst_o = load_ocean(ocean_nc)
+                            if rst_o.get("uo") is not None: ocean.uo = rst_o["uo"]
+                            if rst_o.get("vo") is not None: ocean.vo = rst_o["vo"]
+                            if rst_o.get("eta") is not None: ocean.eta = rst_o["eta"]
+                            if rst_o.get("Ts") is not None: ocean.Ts = rst_o["Ts"]
+                            print("[Autosave] Ocean state overridden from 'data/ocean.nc'.")
+                except Exception as _loe:
+                    print(f"[Autosave] ocean.nc load skipped: {_loe}")
                 # Load astronomical epoch if present
                 try:
                     t_loaded = rst.get("t_seconds", None)
@@ -1310,7 +1466,7 @@ def main():
         # Load genes autosave JSON (if present) before LAI/species weights
         if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
             try:
-                genes_path = os.getenv("QD_ECO_GENES_JSON_PATH") or os.path.join("data", "genes_autosave.json")
+                genes_path = os.getenv("QD_ECO_GENES_JSON_PATH") or os.path.join("data", "genes.json")
                 if os.path.exists(genes_path) and hasattr(eco, "load_genes_json"):
                     eco.load_genes_json(genes_path)
             except Exception as _egl:
@@ -1318,7 +1474,7 @@ def main():
                     print(f"[Ecology] genes autosave load skipped: {_egl}")
         # Try to load ecology autosave (optional)
         if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
-            eco_npz = os.path.join("data", "eco_autosave.npz")
+            eco_npz = os.path.join("data", "ecology.nc")
             if os.path.exists(eco_npz):
                 _ = load_eco_autosave(eco, eco_npz)
 
@@ -1389,7 +1545,21 @@ def main():
 
     def _autosave_hook():
         try:
+            # Core and ecology
             save_autosave("data", grid, gcm, ocean, land_mask, W_land, S_snow, eco, day_value=current_day[0])
+            # Ocean physical state
+            if ocean is not None:
+                save_ocean(os.path.join("data", "ocean.nc"), grid, ocean, current_day[0])
+            # Phytoplankton: bio/optical JSON and distributions
+            if phyto is not None:
+                try:
+                    phyto.save_bio_json(os.path.join("data", "plankton.json"), current_day[0])
+                except Exception as _pb:
+                    print(f"[Plankton] bio json save failed: {_pb}")
+                try:
+                    phyto.save_distribution_nc(os.path.join("data", "plankton.nc"), current_day[0])
+                except Exception as _pn:
+                    print(f"[Plankton] distribution save failed: {_pn}")
         except Exception as _ae:
             print(f"[Autosave] Save failed: {_ae}")
 
@@ -2020,6 +2190,16 @@ def main():
         try:
             save_restart(restart_out, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow, t_seconds=t_sec_final)
             print(f"[Restart] Saved final state to '{restart_out}'.")
+            # Also export ocean.nc alongside restart_out (standardized ocean state)
+            try:
+                out_dir = os.path.dirname(restart_out) or "."
+                oce_path = os.path.join(out_dir, "ocean.nc")
+                if ocean is not None:
+                    _ok_o = save_ocean(oce_path, grid, ocean, day_value=current_day[0])
+                    if _ok_o:
+                        print(f"[Restart] Ocean state saved to '{oce_path}'.")
+            except Exception as _roe:
+                print(f"[Restart] Ocean state save skipped: {_roe}")
         except Exception as e:
             print(f"[Restart] Failed to save '{restart_out}': {e}")
 

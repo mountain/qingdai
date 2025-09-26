@@ -573,100 +573,112 @@ class EcologyAdapter:
     # --- M1.5: Autosave / Load of extended ecology state ---
     def save_autosave(self, path_npz: str, day_value: float | None = None) -> bool:
         """
-        Save extended ecology state (LAI, species_weights, bands, weights, species reflectance)
-        into a single NPZ file with atomic replace and rolling backups.
-
+        Save extended ecology state to a single file with atomic replace and optional rolling backups.
+        Supports:
+          - NPZ (legacy/debug)
+          - NetCDF (preferred): ecology.nc (standardized)
         Env (optional):
-          - QD_ECO_AUTOSAVE_KEEP (default 4): number of timestamped backups to keep
+          - QD_ECO_AUTOSAVE_KEEP (default 4): number of timestamped backups to keep (applies to same extension)
         """
         try:
-            data = {}
-            # Schema tag
-            data["schema_version"] = np.int32(1)
-            # Mandatory (backward compatibility)
-            if getattr(self, "pop", None) is not None:
-                LAI_src = getattr(self.pop, "LAI", None)
-                if LAI_src is None and hasattr(self.pop, "total_LAI"):
-                    LAI_src = self.pop.total_LAI()
-                data["LAI"] = np.asarray(LAI_src, dtype=float)
-                data["species_weights"] = np.asarray(getattr(self.pop, "species_weights", np.asarray([1.0])), dtype=float)
-            # Bands and weights
-            data["bands_lambda_edges"] = np.asarray(self.bands.lambda_edges, dtype=float)
-            data["bands_lambda_centers"] = np.asarray(self.bands.lambda_centers, dtype=float)
-            data["bands_delta_lambda"] = np.asarray(self.bands.delta_lambda, dtype=float)
-            data["w_b"] = np.asarray(self.w_b, dtype=float)
-            # Species reflectance (if available)
-            try:
-                if getattr(self.pop, "_species_R_leaf", None) is not None:
-                    data["R_species_nb"] = np.asarray(self.pop._species_R_leaf, dtype=float)
-            except Exception:
-                pass
-            # Optional: day stamp
-            if day_value is not None:
-                data["day_value"] = float(day_value)
-            # Params snapshot (for audit/troubleshooting; stored as string arrays)
-            try:
-                ps = {
-                    "QD_ECO_SUBSTEP_EVERY_NPHYS": os.getenv("QD_ECO_SUBSTEP_EVERY_NPHYS", "1"),
-                    "QD_ECO_LAI_ALBEDO_WEIGHT": os.getenv("QD_ECO_LAI_ALBEDO_WEIGHT", "1.0"),
-                    "QD_ECO_FEEDBACK_MODE": os.getenv("QD_ECO_FEEDBACK_MODE", "instant"),
-                    "QD_ECO_ALBEDO_COUPLE_FREQ": os.getenv("QD_ECO_ALBEDO_COUPLE_FREQ", "subdaily"),
-                    "QD_ECO_LIGHT_UPDATE_EVERY_HOURS": os.getenv("QD_ECO_LIGHT_UPDATE_EVERY_HOURS", "6"),
-                    "QD_ECO_LIGHT_RECOMPUTE_LAI_DELTA": os.getenv("QD_ECO_LIGHT_RECOMPUTE_LAI_DELTA", "0.05"),
-                    "QD_ECO_SEED_BANK_RETAIN": os.getenv("QD_ECO_SEED_BANK_RETAIN", "0.2"),
-                    "QD_ECO_SEED_BANK_MAX": os.getenv("QD_ECO_SEED_BANK_MAX", "1000"),
-                    "QD_ECO_SEED_GERMINATE_FRAC": os.getenv("QD_ECO_SEED_GERMINATE_FRAC", "0.1"),
-                    "QD_ECO_SEED_BANK_DECAY": os.getenv("QD_ECO_SEED_BANK_DECAY", "0.02"),
-                }
-                data["params_snapshot_keys"] = np.asarray(list(ps.keys()))
-                data["params_snapshot_vals"] = np.asarray(list(ps.values()))
-            except Exception:
-                pass
-            # RNG snapshot (best-effort; CPython RandomState only)
-            try:
-                rng_state = np.random.get_state()
-                data["rng_state_kind"] = np.asarray([rng_state[0]])
-                data["rng_state_values"] = np.asarray(rng_state[1])
-                data["rng_state_pos"] = np.asarray([rng_state[2]])
-                data["rng_state_has_gauss"] = np.asarray([rng_state[3]])
-                data["rng_state_cached_gaussian"] = np.asarray([rng_state[4]])
-            except Exception:
-                pass
-
-            # Prepare paths
             out_dir = os.path.dirname(path_npz) or "."
             base = os.path.basename(path_npz)
             name, ext = os.path.splitext(base)
+            os.makedirs(out_dir, exist_ok=True)
             ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             backup_path = os.path.join(out_dir, f"{name}_{ts}{ext}")
             tmp_path = os.path.join(out_dir, f".{name}.tmp{ext}")
 
-            os.makedirs(out_dir, exist_ok=True)
+            # Collect data
+            LAI_src = None
+            species_w = None
+            R_species_nb = None
+            if getattr(self, "pop", None) is not None:
+                LAI_src = getattr(self.pop, "LAI", None)
+                if LAI_src is None and hasattr(self.pop, "total_LAI"):
+                    LAI_src = self.pop.total_LAI()
+                species_w = np.asarray(getattr(self.pop, "species_weights", np.asarray([1.0])), dtype=float)
+                if getattr(self.pop, "_species_R_leaf", None) is not None:
+                    R_species_nb = np.asarray(self.pop._species_R_leaf, dtype=float)
 
-            # Atomic write: write to tmp, fsync, then replace
-            try:
-                # np.savez doesn't expose fileno; open file handle ourselves
+            # Extension switch
+            if ext.lower() == ".nc":
+                # Write NetCDF
+                from netCDF4 import Dataset
+                with Dataset(tmp_path, "w") as ds:
+                    # Dimensions
+                    nlat, nlon = self.grid.n_lat, self.grid.n_lon
+                    ds.createDimension("lat", nlat)
+                    ds.createDimension("lon", nlon)
+                    if species_w is not None:
+                        ds.createDimension("species", int(species_w.size))
+                    ds.createDimension("band", int(self.bands.nbands))
+
+                    # Coordinates
+                    vlat = ds.createVariable("lat", "f4", ("lat",))
+                    vlon = ds.createVariable("lon", "f4", ("lon",))
+                    vlat[:] = self.grid.lat
+                    vlon[:] = self.grid.lon
+
+                    # Core fields
+                    if LAI_src is not None:
+                        vLAI = ds.createVariable("LAI", "f4", ("lat", "lon"))
+                        vLAI[:] = np.asarray(LAI_src, dtype=np.float32)
+                    if species_w is not None:
+                        vsw = ds.createVariable("species_weights", "f4", ("species",))
+                        vsw[:] = species_w.astype(np.float32)
+                    # Bands
+                    vcent = ds.createVariable("bands_lambda_centers", "f4", ("band",))
+                    vdl = ds.createVariable("bands_delta_lambda", "f4", ("band",))
+                    vw = ds.createVariable("w_b", "f4", ("band",))
+                    vcent[:] = np.asarray(self.bands.lambda_centers, dtype=np.float32)
+                    vdl[:] = np.asarray(self.bands.delta_lambda, dtype=np.float32)
+                    vw[:] = np.asarray(self.w_b, dtype=np.float32)
+
+                    # Species reflectance
+                    if R_species_nb is not None and species_w is not None:
+                        vR = ds.createVariable("R_species_nb", "f4", ("species", "band"))
+                        vR[:] = R_species_nb.astype(np.float32)
+
+                    # Optional day
+                    if day_value is not None:
+                        vday = ds.createVariable("day_value", "f4")
+                        vday[...] = float(day_value)
+
+                    # Metadata
+                    ds.setncattr("title", "Qingdai Ecology State")
+                    ds.setncattr("schema_version", 1)
+                    ds.setncattr("source", "EcologyAdapter.save_autosave")
+                os.replace(tmp_path, path_npz)
+            else:
+                # NPZ fallback
+                data = {}
+                data["schema_version"] = np.int32(1)
+                if LAI_src is not None:
+                    data["LAI"] = np.asarray(LAI_src, dtype=float)
+                if species_w is not None:
+                    data["species_weights"] = species_w
+                data["bands_lambda_centers"] = np.asarray(self.bands.lambda_centers, dtype=float)
+                data["bands_delta_lambda"] = np.asarray(self.bands.delta_lambda, dtype=float)
+                data["w_b"] = np.asarray(self.w_b, dtype=float)
+                if R_species_nb is not None:
+                    data["R_species_nb"] = R_species_nb
+                if day_value is not None:
+                    data["day_value"] = float(day_value)
                 with open(tmp_path, "wb") as f:
                     np.savez(f, **data)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp_path, path_npz)
-            finally:
-                # Best-effort cleanup if tmp remains
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
 
-            # Create a timestamped backup copy (best-effort)
+            # Timestamped backup (best-effort)
             try:
                 import shutil
                 shutil.copy2(path_npz, backup_path)
             except Exception:
                 backup_path = None
 
-            # Rolling backup retention
+            # Rolling retention
             try:
                 keep = int(os.getenv("QD_ECO_AUTOSAVE_KEEP", "4"))
                 pattern = os.path.join(out_dir, f"{name}_*{ext}")
@@ -679,22 +691,22 @@ class EcologyAdapter:
             except Exception:
                 pass
 
-            # Also write/update genes autosave JSON (best-effort; stable name)
+            # Also write genes.json next to ecology state (best-effort, standardized name)
             try:
-                genes_json = os.path.join(out_dir, "genes_autosave.json")
+                genes_json = os.path.join(out_dir, "genes.json")
                 _ = self.save_genes_json(genes_json, day_value=day_value if day_value is not None else None)
             except Exception:
                 pass
 
             if self._diag:
-                msg = f"[Ecology] Autosave+ written: {path_npz} (keys={list(data.keys())})"
+                msg = f"[Ecology] Autosave written: {path_npz}"
                 if backup_path:
                     msg += f"; backup={backup_path}"
                 print(msg)
             return True
         except Exception as e:
             if self._diag:
-                print(f"[Ecology] Autosave+ save failed: {e}")
+                print(f"[Ecology] Autosave+ load failed: {e}")
             return False
 
     def load_autosave(self, path_npz: str, *, on_mismatch: str = "fallback") -> bool:
@@ -705,9 +717,24 @@ class EcologyAdapter:
         if getattr(self, "pop", None) is None:
             return False
         try:
-            data = np.load(path_npz)
-            LAI = np.asarray(data.get("LAI"))
-            w = np.asarray(data.get("species_weights"))
+            import os as _os
+            ext = _os.path.splitext(path_npz)[1].lower()
+            centers = None
+            R_species_nb = None
+            if ext == ".nc":
+                from netCDF4 import Dataset as _DS
+                with _DS(path_npz, "r") as ds:
+                    LAI = np.asarray(ds.variables["LAI"]) if "LAI" in ds.variables else None
+                    w = np.asarray(ds.variables["species_weights"]) if "species_weights" in ds.variables else None
+                    centers = np.asarray(ds.variables["bands_lambda_centers"]) if "bands_lambda_centers" in ds.variables else None
+                    if "R_species_nb" in ds.variables:
+                        R_species_nb = np.asarray(ds.variables["R_species_nb"])
+            else:
+                data = np.load(path_npz)
+                LAI = np.asarray(data.get("LAI"))
+                w = np.asarray(data.get("species_weights"))
+                centers = data.get("bands_lambda_centers")
+                R_species_nb = data.get("R_species_nb")
             if LAI is None or LAI.ndim != 2 or w is None or w.ndim != 1:
                 if self._diag:
                     print("[Ecology] Autosave+ malformed: require LAI (2D) and species_weights (1D).")
@@ -730,8 +757,6 @@ class EcologyAdapter:
             pop.LAI_layers = np.sum(pop.LAI_layers_SK, axis=0)
 
             # Try to restore bands & reflectance if shapes compatible
-            centers = data.get("bands_lambda_centers")
-            R_species_nb = data.get("R_species_nb")
             ok_adv = (centers is not None and len(centers) == self.bands.nbands and
                       R_species_nb is not None and R_species_nb.shape[1] == self.bands.nbands)
             if ok_adv:

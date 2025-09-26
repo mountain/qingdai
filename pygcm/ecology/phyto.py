@@ -621,3 +621,315 @@ class PhytoManager:
             self.C_phyto_s[s, :, :] = field
         if self.diag:
             print("[Phyto] State reset to defaults.")
+
+    # --- Standardized IO: plankton.json (bio/optics) and plankton.nc (distributions) ---
+
+    def save_bio_json(self, path: str, day_value: float | None = None) -> bool:
+        """
+        Save phytoplankton biology & optics configuration to a human-readable JSON:
+          - schema_version, source, day
+          - bands: nbands, lambda_centers_nm[], delta_lambda_nm[]
+          - params (shared): alpha_P, Q10, T_ref, lambda_sink_m_per_day
+          - species arrays: mu_max_s[], m0_s[], c_reflect_s[], p_reflect_s[], shape_sb[S][NB]
+          - kd optics: Kd0_b[NB], kchl_b[NB], Apure_b[NB]
+        This mirrors 'genes.json' style for terrestrial ecology.
+        """
+        try:
+            import json as _json
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            doc = {
+                "schema_version": 1,
+                "source": "PyGCM.PhytoManager.save_bio_json",
+                "day": float(day_value) if day_value is not None else None,
+                "bands": {
+                    "nbands": int(self.bands.nbands),
+                    "lambda_centers_nm": [float(x) for x in np.asarray(self.bands.lambda_centers, dtype=float).tolist()],
+                    "delta_lambda_nm": [float(x) for x in np.asarray(self.bands.delta_lambda, dtype=float).tolist()],
+                },
+                "params": {
+                    "alpha_P": float(self.params.alpha_P),
+                    "Q10": float(self.params.Q10),
+                    "T_ref": float(self.params.T_ref),
+                    "lambda_sink_m_per_day": float(self.params.lambda_sink_m_per_day),
+                },
+                "species": {
+                    "mu_max_s": [float(x) for x in np.asarray(self.mu_max_s, dtype=float).tolist()],
+                    "m0_s": [float(x) for x in np.asarray(self.m0_s, dtype=float).tolist()],
+                    "c_reflect_s": [float(x) for x in np.asarray(self.c_reflect_s, dtype=float).tolist()],
+                    "p_reflect_s": [float(x) for x in np.asarray(self.p_reflect_s, dtype=float).tolist()],
+                    # Store per-species spectral shapes (Gaussian weights per band, normalized)
+                    "shape_sb": np.asarray(self.shape_sb, dtype=float).tolist(),
+                },
+                "optics": {
+                    "Kd0_b": [float(x) for x in np.asarray(self.Kd0_b, dtype=float).tolist()],
+                    "kchl_b": [float(x) for x in np.asarray(self.kchl_b, dtype=float).tolist()],
+                    "Apure_b": [float(x) for x in np.asarray(self.Apure_b, dtype=float).tolist()],
+                },
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(doc, f, ensure_ascii=False, indent=2)
+            if self.diag:
+                print(f"[Phyto] Bio/optics JSON written: '{path}' (S={self.S}, NB={self.bands.nbands})")
+            return True
+        except Exception as e:
+            if self.diag:
+                print(f"[Phyto] save_bio_json failed: {e}")
+            return False
+
+    def save_distribution_nc(self, path: str, day_value: float | None = None) -> bool:
+        """
+        Save gridded distributions to NetCDF 'plankton.nc':
+          - dims: species, band, lat, lon
+          - lat, lon coordinates
+          - C_phyto_s[S,lat,lon] (mg/m^3)
+          - alpha_water_bands[band,lat,lon] (if available)
+          - alpha_water_scalar[lat,lon]
+          - Kd_490[lat,lon]
+          - attributes: H_mld, S, NB, day
+        """
+        try:
+            from netCDF4 import Dataset
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with Dataset(path, "w") as ds:
+                NL, NM = self.NL, self.NM
+                ds.createDimension("lat", NL)
+                ds.createDimension("lon", NM)
+                ds.createDimension("species", int(self.S))
+                ds.createDimension("band", int(self.bands.nbands))
+
+                vlat = ds.createVariable("lat", "f4", ("lat",))
+                vlon = ds.createVariable("lon", "f4", ("lon",))
+                vlat[:] = self.grid.lat
+                vlon[:] = self.grid.lon
+
+                # Chlorophyll distributions
+                vC = ds.createVariable("C_phyto_s", "f4", ("species", "lat", "lon"))
+                vC[:] = np.asarray(self.C_phyto_s, dtype=np.float32)
+
+                # Albedo maps
+                if self.alpha_water_bands is not None:
+                    vab = ds.createVariable("alpha_water_bands", "f4", ("band", "lat", "lon"))
+                    vab[:] = np.asarray(self.alpha_water_bands, dtype=np.float32)
+                vas = ds.createVariable("alpha_water_scalar", "f4", ("lat", "lon"))
+                vas[:] = np.asarray(self.alpha_water_scalar, dtype=np.float32)
+
+                # Kd(490)
+                vk = ds.createVariable("Kd_490", "f4", ("lat", "lon"))
+                vk[:] = np.asarray(self.Kd_490, dtype=np.float32)
+
+                # Band centers (for reference)
+                vb = ds.createVariable("bands_lambda_centers", "f4", ("band",))
+                vb[:] = np.asarray(self.bands.lambda_centers, dtype=np.float32)
+
+                # Attributes
+                ds.setncattr("title", "Qingdai Phytoplankton Distributions")
+                ds.setncattr("H_mld_m", float(self.H_mld))
+                ds.setncattr("S", int(self.S))
+                ds.setncattr("NB", int(self.bands.nbands))
+                if day_value is not None:
+                    ds.setncattr("day", float(day_value))
+            if self.diag:
+                print(f"[Phyto] Distribution NetCDF written: '{path}'")
+            return True
+        except Exception as e:
+            if self.diag:
+                print(f"[Phyto] save_distribution_nc failed: {e}")
+            return False
+
+    def load_bio_json(self, path: str, *, on_mismatch: str = "keep") -> bool:
+        """
+        Load phytoplankton biology & optics configuration from plankton.json.
+        on_mismatch:
+          - 'keep': keep current bands if JSON bands mismatch; rebuild shapes to current NB
+          - 'replace': attempt to replace bands with JSON bands (if compatible with the rest of model)
+        Returns True on successful application.
+        """
+        try:
+            import json as _json
+            with open(path, "r", encoding="utf-8") as f:
+                doc = _json.load(f)
+        except Exception as e:
+            if self.diag:
+                print(f"[Phyto] load_bio_json failed: {e}")
+            return False
+
+        try:
+            bands_json = doc.get("bands", {}) or {}
+            nb_json = int(bands_json.get("nbands", self.bands.nbands))
+            lam_cent = np.asarray(bands_json.get("lambda_centers_nm", []), dtype=float)
+            dlam = np.asarray(bands_json.get("delta_lambda_nm", []), dtype=float)
+
+            # Decide bands handling
+            replace_bands = (on_mismatch == "replace" and nb_json > 0 and lam_cent.size == nb_json)
+            if replace_bands:
+                # Rebuild SpectralBands using JSON band definition
+                try:
+                    from .spectral import SpectralBands
+                    lam_edges = None
+                    if dlam.size == nb_json:
+                        # Derive edges from centers and delta if possible (approx)
+                        half = 0.5 * dlam
+                        lam_edges = np.zeros((nb_json + 1,), dtype=float)
+                        lam_edges[0] = lam_cent[0] - half[0]
+                        for i in range(1, nb_json):
+                            lam_edges[i] = 0.5 * (lam_cent[i-1] + lam_cent[i])
+                        lam_edges[-1] = lam_cent[-1] + half[-1]
+                    self.bands = SpectralBands(
+                        nbands=nb_json,
+                        lambda_centers=lam_cent if lam_cent.size == nb_json else None,
+                        delta_lambda=dlam if dlam.size == nb_json else None,
+                        lambda_edges=lam_edges
+                    )
+                    if self.diag:
+                        print(f"[Phyto] Bands replaced from JSON: NB={self.bands.nbands}")
+                except Exception as _be:
+                    if self.diag:
+                        print(f"[Phyto] bands replace failed, keeping current: {_be}")
+
+            # Update shared params
+            p = doc.get("params", {}) or {}
+            self.params.alpha_P = float(p.get("alpha_P", self.params.alpha_P))
+            self.params.Q10 = float(p.get("Q10", self.params.Q10))
+            self.params.T_ref = float(p.get("T_ref", self.params.T_ref))
+            self.params.lambda_sink_m_per_day = float(p.get("lambda_sink_m_per_day", self.params.lambda_sink_m_per_day))
+
+            # Update species arrays
+            sp = doc.get("species", {}) or {}
+            mu_max_s = np.asarray(sp.get("mu_max_s", []), dtype=float)
+            m0_s = np.asarray(sp.get("m0_s", []), dtype=float)
+            c_reflect_s = np.asarray(sp.get("c_reflect_s", []), dtype=float)
+            p_reflect_s = np.asarray(sp.get("p_reflect_s", []), dtype=float)
+            shape_sb = np.asarray(sp.get("shape_sb", []), dtype=float)
+
+            # Resize S if JSON provides arrays of a different length
+            def _apply_arr(name, arr_json, fallback):
+                nonlocal_changed = False
+                if arr_json is not None and arr_json.size > 0:
+                    return arr_json.astype(float), True
+                return fallback, False
+
+            changed_any = False
+            if mu_max_s.size > 0:
+                self.mu_max_s = mu_max_s.astype(float); changed_any = True
+            if m0_s.size > 0:
+                self.m0_s = m0_s.astype(float); changed_any = True
+            if c_reflect_s.size > 0:
+                self.c_reflect_s = c_reflect_s.astype(float); changed_any = True
+            if p_reflect_s.size > 0:
+                self.p_reflect_s = p_reflect_s.astype(float); changed_any = True
+            # Update S from arrays length if consistent
+            S_new = max(self.S,
+                        self.mu_max_s.size,
+                        self.m0_s.size,
+                        self.c_reflect_s.size,
+                        self.p_reflect_s.size)
+            if S_new != self.S:
+                self.S = int(S_new)
+                # Ensure arrays length match S
+                def _ensure_len(a, val=1.0):
+                    if a.size == self.S:
+                        return a
+                    if a.size == 0:
+                        return np.full((self.S,), val, dtype=float)
+                    if a.size < self.S:
+                        pad = np.full((self.S - a.size,), a[-1] if a.size > 0 else val, dtype=float)
+                        return np.concatenate([a, pad], axis=0)
+                    return a[:self.S]
+                self.mu_max_s = _ensure_len(self.mu_max_s, self.params.mu_max)
+                self.m0_s = _ensure_len(self.m0_s, self.params.m0)
+                self.c_reflect_s = _ensure_len(self.c_reflect_s, 0.02)
+                self.p_reflect_s = _ensure_len(self.p_reflect_s, 0.5)
+                # Resize shapes to [S, NB]
+                NB = self.bands.nbands
+                shp = np.zeros((self.S, NB), dtype=float)
+                if shape_sb.ndim == 2:
+                    for s in range(min(self.S, shape_sb.shape[0])):
+                        v = shape_sb[s, :]
+                        if v.size == NB:
+                            shp[s, :] = v / (float(np.sum(v)) + 1e-12)
+                self.shape_sb = np.where(shp > 0, shp, self.shape_sb if getattr(self, "shape_sb", None) is not None else shp)
+
+            # Optics Kd and Apure per band
+            opt = doc.get("optics", {}) or {}
+            Kd0_b = np.asarray(opt.get("Kd0_b", []), dtype=float)
+            kchl_b = np.asarray(opt.get("kchl_b", []), dtype=float)
+            Apure_b = np.asarray(opt.get("Apure_b", []), dtype=float)
+            NB = self.bands.nbands
+            if Kd0_b.size == NB:
+                self.Kd0_b = Kd0_b.astype(float)
+            if kchl_b.size == NB:
+                self.kchl_b = kchl_b.astype(float)
+            if Apure_b.size == NB:
+                self.Apure_b = Apure_b.astype(float)
+
+            # Recompute band weights with current bands
+            from .spectral import band_weights_from_mode
+            self.w_b = band_weights_from_mode(self.bands)
+
+            if self.diag:
+                print(f"[Phyto] Bio/optics JSON loaded: S={self.S}, NB={self.bands.nbands} (bands {'replaced' if replace_bands else 'kept'})")
+            return True
+        except Exception as e:
+            if self.diag:
+                print(f"[Phyto] load_bio_json apply failed: {e}")
+            return False
+
+    def load_distribution_nc(self, path: str, *, on_mismatch: str = "keep") -> bool:
+        """
+        Load gridded distributions from plankton.nc into current manager.
+        Applies only if shapes match (S, NB, NL, NM). Returns True on success.
+        on_mismatch: 'keep' → silently keep current state if dims mismatch; 'reset' → reset defaults.
+        """
+        try:
+            from netCDF4 import Dataset
+            with Dataset(path, "r") as ds:
+                C = np.asarray(ds.variables["C_phyto_s"]) if "C_phyto_s" in ds.variables else None
+                ab = np.asarray(ds.variables["alpha_water_bands"]) if "alpha_water_bands" in ds.variables else None
+                aS = np.asarray(ds.variables["alpha_water_scalar"]) if "alpha_water_scalar" in ds.variables else None
+                kd = np.asarray(ds.variables["Kd_490"]) if "Kd_490" in ds.variables else None
+                # Optional: bands check
+                try:
+                    lam_nc = np.asarray(ds.variables["bands_lambda_centers"])
+                    if lam_nc.size == self.bands.nbands:
+                        pass  # OK; otherwise ignore silently (bands might differ)
+                except Exception:
+                    pass
+        except Exception as e:
+            if self.diag:
+                print(f"[Phyto] load_distribution_nc failed: {e}")
+            return False
+
+        # Validate shapes
+        try:
+            NL, NM = self.NL, self.NM
+            NB = self.bands.nbands
+            okC = (C is not None and C.ndim == 3 and C.shape[1] == NL and C.shape[2] == NM)
+            okAb = (ab is None) or (ab.ndim == 3 and ab.shape[1] == NL and ab.shape[2] == NM and ab.shape[0] == NB)
+            okAS = (aS is None) or (aS.shape == (NL, NM))
+            okKd = (kd is None) or (kd.shape == (NL, NM))
+            if not okC or not okAb or not okAS or not okKd:
+                if self.diag:
+                    print(f"[Phyto] plankton.nc dims mismatch; keep={on_mismatch=='keep'}")
+                if on_mismatch == "reset":
+                    self.reset_default_state()
+                return False
+
+            # Apply loaded fields
+            self.C_phyto_s = np.clip(C.astype(float), 0.0, np.inf)
+            # enforce ocean mask
+            for s in range(self.S):
+                self.C_phyto_s[s, ~self.ocean_mask] = 0.0
+            if ab is not None:
+                self.alpha_water_bands = np.clip(ab.astype(float), self.alpha_clip_min, self.alpha_clip_max)
+            if aS is not None:
+                self.alpha_water_scalar = np.clip(aS.astype(float), self.alpha_clip_min, self.alpha_clip_max)
+            if kd is not None:
+                self.Kd_490 = np.clip(kd.astype(float), 0.0, np.inf)
+            if self.diag:
+                print(f"[Phyto] plankton.nc loaded: C_phyto_s[{self.C_phyto_s.shape}], "
+                      f"alpha_bands={'OK' if ab is not None else 'none'}, alpha_scalar={'OK' if aS is not None else 'none'}")
+            return True
+        except Exception as e:
+            if self.diag:
+                print(f"[Phyto] apply distribution failed: {e}")
+            return False
