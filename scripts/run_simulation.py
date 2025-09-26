@@ -190,6 +190,12 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
                         )
                 except Exception:
                     pass
+            # Also write stable genes_autosave.json under data/ (best-effort)
+            try:
+                if hasattr(eco, "save_genes_json"):
+                    eco.save_genes_json(os.path.join(data_dir, "genes_autosave.json"), day_value=float(day_value))
+            except Exception:
+                pass
     except Exception as e:
         print(f"[Autosave] Ecology save failed: {e}")
 
@@ -915,6 +921,73 @@ def plot_ecology(grid, land_mask, t_days, output_dir, *, lai=None, alpha_ecology
     _plt.close(fig)
 
 
+def _try_autogen_hydro_network(grid, land_mask, elevation, topo_nc, out_path) -> bool:
+    """
+    Attempt to auto-generate a hydrology routing network NetCDF when missing.
+    Uses the same core routines as scripts/generate_hydrology_maps.py.
+    Returns True on success, False otherwise.
+    """
+    try:
+        from netCDF4 import Dataset
+        import numpy as _np
+        # Reuse helpers from the generator script
+        from scripts.generate_hydrology_maps import (
+            pit_fill,
+            compute_flow_to_index,
+            identify_lakes,
+            compute_lake_outlets,
+            topo_sort_flow_order,
+        )
+        elev0 = elevation if elevation is not None else _np.zeros_like(grid.lat_mesh, dtype=float)
+        land = (land_mask.astype(_np.uint8))
+        src = "procedural" if (not topo_nc or not os.path.exists(str(topo_nc))) else os.path.basename(str(topo_nc))
+        print(f"[HydroRouting] Auto-generating network to '{out_path}' (source={src})...")
+        elev_filled = pit_fill(elev0.copy(), land, max_iters=200, eps=1e-3)
+        flow_to = compute_flow_to_index(grid, elev_filled, land)
+        lake_mask, lake_id, n_lakes = identify_lakes(flow_to, land)
+        lake_outlet_index = compute_lake_outlets(grid, elev_filled, lake_mask, lake_id, land) if int(_np.max(lake_id)) > 0 else None
+        flow_order = topo_sort_flow_order(flow_to, land)
+
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with Dataset(out_path, "w") as ds:
+            nlat, nlon = grid.n_lat, grid.n_lon
+            ds.createDimension("lat", nlat)
+            ds.createDimension("lon", nlon)
+            n_land = int((land == 1).sum())
+            ds.createDimension("n_land", n_land)
+            n_lakes = int(_np.max(lake_id)) if lake_id is not None else 0
+            if n_lakes > 0:
+                ds.createDimension("n_lakes", n_lakes)
+
+            vlat = ds.createVariable("lat", "f4", ("lat",))
+            vlon = ds.createVariable("lon", "f4", ("lon",))
+            vlat[:] = grid.lat.astype(_np.float32)
+            vlon[:] = grid.lon.astype(_np.float32)
+
+            def wvar(name, dtype, dims, data):
+                var = ds.createVariable(name, dtype, dims)
+                var[:] = data
+
+            wvar("land_mask", "u1", ("lat", "lon"), land.astype(_np.uint8))
+            wvar("elevation_filled", "f4", ("lat", "lon"), elev_filled.astype(_np.float32))
+            wvar("flow_to_index", "i4", ("lat", "lon"), flow_to.astype(_np.int32))
+            wvar("flow_order", "i4", ("n_land",), flow_order.astype(_np.int32))
+            wvar("lake_mask", "u1", ("lat", "lon"), lake_mask.astype(_np.uint8))
+            wvar("lake_id", "i4", ("lat", "lon"), lake_id.astype(_np.int32))
+            if n_lakes > 0 and lake_outlet_index is not None:
+                wvar("lake_outlet_index", "i4", ("n_lakes",), lake_outlet_index.astype(_np.int32))
+
+            ds.setncattr("title", "Qingdai Hydrology Network (auto-generated)")
+            ds.setncattr("indexing", "row-major (i=lon index, j=lat index), idx=j*n_lon+i")
+            ds.setncattr("projection", "latlon")
+            ds.setncattr("created_by", "scripts/run_simulation.py (auto)")
+        print("[HydroRouting] Network auto-generation complete.")
+        return True
+    except Exception as e:
+        print(f"[HydroRouting] Auto-generation failed: {e}")
+        return False
+
+
 def main():
     """
     Main function to run the simulation.
@@ -1023,18 +1096,28 @@ def main():
     # Routing (P014): optional river routing and lakes via offline network
     routing = None
     try:
+        HYDRO_ENABLED = (int(os.getenv("QD_HYDRO_ENABLE", "1")) == 1)
         hydro_net = os.getenv("QD_HYDRO_NETCDF", "data/hydrology_network.nc")
-        if int(os.getenv("QD_HYDRO_ENABLE", "1")) == 1 and hydro_net and os.path.exists(hydro_net):
-            routing = RiverRouting(
-                grid,
-                hydro_net,
-                dt_hydro_hours=float(os.getenv("QD_HYDRO_DT_HOURS", "6")),
-                treat_lake_as_water=(int(os.getenv("QD_TREAT_LAKE_AS_WATER", "1")) == 1),
-                alpha_lake=(float(os.getenv("QD_ALPHA_LAKE")) if os.getenv("QD_ALPHA_LAKE") else None),
-                diag=(int(os.getenv("QD_HYDRO_DIAG", "1")) == 1),
-            )
+        if HYDRO_ENABLED:
+            # If network file missing, attempt auto-generation once
+            if not (hydro_net and os.path.exists(hydro_net)):
+                ok_gen = _try_autogen_hydro_network(grid, land_mask, elevation, topo_nc, hydro_net)
+                if not ok_gen or not os.path.exists(hydro_net):
+                    print(f"[HydroRouting] Enabled but network not available; running WITHOUT routing "
+                          f"(QD_HYDRO_NETCDF='{hydro_net}').")
+            # Initialize routing if file now exists
+            if hydro_net and os.path.exists(hydro_net):
+                routing = RiverRouting(
+                    grid,
+                    hydro_net,
+                    dt_hydro_hours=float(os.getenv("QD_HYDRO_DT_HOURS", "6")),
+                    treat_lake_as_water=(int(os.getenv("QD_TREAT_LAKE_AS_WATER", "1")) == 1),
+                    alpha_lake=(float(os.getenv("QD_ALPHA_LAKE")) if os.getenv("QD_ALPHA_LAKE") else None),
+                    diag=(int(os.getenv("QD_HYDRO_DIAG", "1")) == 1),
+                )
+                print(f"[HydroRouting] Enabled with network '{hydro_net}'.")
         else:
-            print(f"[HydroRouting] Disabled or network file not found (QD_HYDRO_NETCDF='{hydro_net}').")
+            print("[HydroRouting] Disabled by QD_HYDRO_ENABLE=0.")
     except Exception as e:
         print(f"[HydroRouting] Initialization skipped due to error: {e}")
         routing = None
@@ -1162,6 +1245,15 @@ def main():
             # Hydrology
             if rst.get("W_land") is not None: W_land = rst["W_land"]
             if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
+            # Load genes autosave JSON (if present) before LAI/species weights
+            if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
+                try:
+                    genes_path = os.getenv("QD_ECO_GENES_JSON_PATH") or os.path.join("data", "genes_autosave.json")
+                    if os.path.exists(genes_path) and hasattr(eco, "load_genes_json"):
+                        eco.load_genes_json(genes_path)
+                except Exception as _egl:
+                    if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                        print(f"[Ecology] genes autosave load skipped: {_egl}")
             # Try to load ecology autosave (optional, persists LAI/species weights)
             if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
                 try:
@@ -1215,6 +1307,15 @@ def main():
                 apply_banded_initial_ts(grid, gcm, ocean, land_mask)
         else:
             apply_banded_initial_ts(grid, gcm, ocean, land_mask)
+        # Load genes autosave JSON (if present) before LAI/species weights
+        if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
+            try:
+                genes_path = os.getenv("QD_ECO_GENES_JSON_PATH") or os.path.join("data", "genes_autosave.json")
+                if os.path.exists(genes_path) and hasattr(eco, "load_genes_json"):
+                    eco.load_genes_json(genes_path)
+            except Exception as _egl:
+                if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                    print(f"[Ecology] genes autosave load skipped: {_egl}")
         # Try to load ecology autosave (optional)
         if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
             eco_npz = os.path.join("data", "eco_autosave.npz")

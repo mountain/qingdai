@@ -116,6 +116,27 @@ class EcologyAdapter:
             if self._diag:
                 print(f"[Ecology] Species bands not set (fallback to single template): {_es}")
 
+        # Map species identities by spread modes: 'seed' → 'tree', 'diffusion' → 'grass'
+        # Respect explicit per-species identity overrides via QD_ECO_SPECIES_{i}_IDENTITY if provided.
+        try:
+            modes = getattr(self.pop, "species_modes", []) if self.pop is not None else []
+            for i, g in enumerate(self.genes_list):
+                # Skip if user explicitly provided IDENTITY for this species
+                if os.getenv(f"QD_ECO_SPECIES_{i}_IDENTITY"):
+                    continue
+                mode_i = (modes[i] if (i < len(modes) and modes[i] in ("seed", "diffusion"))
+                          else ("seed" if i == 1 else "diffusion"))
+                g.identity = ("tree" if mode_i == "seed" else "grass")
+            if self._diag:
+                n_tree = sum(1 for i, g in enumerate(self.genes_list)
+                             if (os.getenv(f"QD_ECO_SPECIES_{i}_IDENTITY") is None) and g.identity == "tree")
+                n_grass = sum(1 for i, g in enumerate(self.genes_list)
+                              if (os.getenv(f"QD_ECO_SPECIES_{i}_IDENTITY") is None) and g.identity == "grass")
+                print(f"[Ecology] Species identities mapped by modes: grass={n_grass}, tree={n_tree}")
+        except Exception as _ei:
+            if self._diag:
+                print(f"[Ecology] Species identity mapping skipped: {_ei}")
+
     def step_subdaily(self,
                       I_total: np.ndarray,
                       cloud_eff: np.ndarray | float,
@@ -258,6 +279,151 @@ class EcologyAdapter:
         except Exception as e:
             if self._diag:
                 print(f"[Ecology] Genes export failed: {e}")
+
+    # --- Genes autosave helpers (JSON) ---
+    def save_genes_json(self, path: str, day_value: float | None = None) -> bool:
+        """
+        Save current core gene information (per-species Genes + band weights) to a stable JSON:
+        - Intended for autosave/resume under data/genes_autosave.json
+        - Compact but self-contained: includes bands nb/weights; each gene embeds peak list
+        """
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        try:
+            # Species weights (optional snapshot)
+            try:
+                weights = [float(x) for x in np.asarray(getattr(self.pop, "species_weights", []), dtype=float).tolist()]
+            except Exception:
+                weights = None
+            genes_tbl = []
+            for i, g in enumerate(self.genes_list):
+                peaks = getattr(g, "absorption_peaks", []) or []
+                peaks_out = []
+                for pk in peaks:
+                    try:
+                        sigma = float(pk.width_nm)
+                        peaks_out.append({
+                            "center_nm": float(pk.center_nm),
+                            "sigma_nm": sigma,
+                            "variance_nm2": float(sigma * sigma),
+                            "height": float(pk.height),
+                        })
+                    except Exception:
+                        peaks_out.append({
+                            "center_nm": float(getattr(pk, "center_nm", 0.0)),
+                            "sigma_nm": float(getattr(pk, "width_nm", 0.0)),
+                            "variance_nm2": float(getattr(pk, "width_nm", 0.0)) ** 2,
+                            "height": float(getattr(pk, "height", 0.0)),
+                        })
+                entry = {
+                    "index": i,
+                    "identity": getattr(g, "identity", f"sp{i}"),
+                    "provenance": getattr(g, "provenance", None),
+                    "alloc_root": float(getattr(g, "alloc_root", 0.0)),
+                    "alloc_stem": float(getattr(g, "alloc_stem", 0.0)),
+                    "alloc_leaf": float(getattr(g, "alloc_leaf", 0.0)),
+                    "leaf_area_per_energy": float(getattr(g, "leaf_area_per_energy", 0.0)),
+                    "drought_tolerance": float(getattr(g, "drought_tolerance", 0.0)),
+                    "gdd_germinate": float(getattr(g, "gdd_germinate", 0.0)),
+                    "lifespan_days": int(getattr(g, "lifespan_days", 0)),
+                    "peaks_model": "gaussian",
+                    "peaks": peaks_out,
+                }
+                genes_tbl.append(entry)
+            doc = {
+                "schema_version": 3,
+                "source": "PyGCM.EcologyAdapter.save_genes_json",
+                "day": float(day_value) if day_value is not None else None,
+                "bands": {
+                    "nbands": int(self.bands.nbands),
+                    "band_weights": [float(x) for x in np.asarray(self.w_b, dtype=float).tolist()]
+                },
+                "genes": genes_tbl,
+            }
+            if weights is not None and len(weights) > 0:
+                doc["species_weights"] = weights
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+            if self._diag:
+                print(f"[Ecology] Genes autosave written: {path} (Ns={len(genes_tbl)})")
+            return True
+        except Exception as e:
+            if self._diag:
+                print(f"[Ecology] Genes autosave save failed: {e}")
+            return False
+
+    def load_genes_json(self, path: str, *, on_mismatch: str = "keep") -> bool:
+        """
+        Load genes autosave JSON (data/genes_autosave.json) and rebuild per-species reflectance.
+        - If bands mismatch, we still rebuild reflectance using current bands from stored peaks.
+        - If population present, update species reflectance table to new Ns; weights apply later via NPZ.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception as e:
+            if self._diag:
+                print(f"[Ecology] Genes autosave load failed: {e}")
+            return False
+        try:
+            genes_in = []
+            for rec in doc.get("genes", []):
+                # Reconstruct Peaks and Genes
+                peaks = []
+                for pk in rec.get("peaks", []) or []:
+                    try:
+                        # prefer sigma_nm if provided; variance_nm2 kept for back-compat
+                        sigma = float(pk.get("sigma_nm", 0.0))
+                        if sigma <= 0 and "variance_nm2" in pk:
+                            var = float(pk.get("variance_nm2", 0.0))
+                            sigma = float(np.sqrt(max(0.0, var)))
+                        peaks.append(Peak(float(pk.get("center_nm", 0.0)), sigma, float(pk.get("height", 0.0))))
+                    except Exception:
+                        continue
+                g = Genes(
+                    identity=str(rec.get("identity", "sp")),
+                    alloc_root=float(rec.get("alloc_root", 0.3)),
+                    alloc_stem=float(rec.get("alloc_stem", 0.2)),
+                    alloc_leaf=float(rec.get("alloc_leaf", 0.5)),
+                    leaf_area_per_energy=float(rec.get("leaf_area_per_energy", 2.0e-3)),
+                    absorption_peaks=peaks,
+                    drought_tolerance=float(rec.get("drought_tolerance", 0.3)),
+                    gdd_germinate=float(rec.get("gdd_germinate", 80.0)),
+                    lifespan_days=int(rec.get("lifespan_days", 365)),
+                    provenance="autosave:genes_json",
+                )
+                # normalize allocations
+                s = g.alloc_root + g.alloc_stem + g.alloc_leaf
+                if s > 0:
+                    g.alloc_root /= s; g.alloc_stem /= s; g.alloc_leaf /= s
+                genes_in.append(g)
+
+            if len(genes_in) == 0:
+                if self._diag:
+                    print("[Ecology] Genes autosave contains no genes; keeping current.")
+                return False
+
+            # Apply: replace adapter genes list
+            self.genes_list = genes_in
+
+            # Rebuild per-species reflectance with current bands
+            try:
+                R_species_nb = np.stack([reflectance_from_genes(self.bands, g) for g in self.genes_list], axis=0)
+                if getattr(self, "pop", None) is not None:
+                    self.pop.set_species_reflectance_bands(R_species_nb)
+            except Exception as e:
+                if self._diag:
+                    print(f"[Ecology] Genes reflectance rebuild failed: {e}")
+
+            if self._diag:
+                print(f"[Ecology] Genes autosave loaded: Ns={len(self.genes_list)} (band nb={self.bands.nbands})")
+            return True
+        except Exception as e:
+            if self._diag:
+                print(f"[Ecology] Genes autosave parse failed: {e}")
+            return False
 
     # M2: daily LAI update from soil water proxy ∈[0,1]
     def step_daily(self, soil_water_index: np.ndarray | float | None) -> None:
@@ -510,6 +676,13 @@ class EcologyAdapter:
                         os.remove(old)
                     except Exception:
                         pass
+            except Exception:
+                pass
+
+            # Also write/update genes autosave JSON (best-effort; stable name)
+            try:
+                genes_json = os.path.join(out_dir, "genes_autosave.json")
+                _ = self.save_genes_json(genes_json, day_value=day_value if day_value is not None else None)
             except Exception:
                 pass
 
