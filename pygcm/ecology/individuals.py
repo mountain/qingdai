@@ -311,6 +311,31 @@ class IndividualPool:
         # Update species weights (global) from area-summed LAI (just for adapter bookkeeping)
         pop.recompute_species_weights_from_LAI()
 
+        # M3+: Couple per-individual reproduction → PopulationManager.seed_bank
+        try:
+            if int(os.getenv("QD_ECO_INDIV_SEED_COUPLE", "1")) == 1 and hasattr(pop, "seed_bank"):
+                # per-cell total energy over the day
+                E_tot_cells = denom  # [C]
+                repro_frac = float(getattr(pop, "repro_fraction", float(os.getenv("QD_ECO_REPRO_FRACTION", "0.2"))))
+                seed_energy = float(getattr(pop, "seed_energy", float(os.getenv("QD_ECO_SEED_ENERGY", "1.0"))))
+                retain = float(os.getenv("QD_ECO_SEED_BANK_RETAIN", "0.2"))
+                bank_max = float(os.getenv("QD_ECO_SEED_BANK_MAX", "1000.0"))
+                # soil gating (reuse soil_idx if available)
+                soil_cells = None
+                if 'soil_idx' in locals():
+                    soil_cells = soil_idx[self.sample_j, self.sample_i]
+                # Seeds produced per cell (retained portion)
+                seeds_cells = np.maximum(0.0, repro_frac) * np.maximum(0.0, E_tot_cells) / max(seed_energy, 1e-12)
+                if soil_cells is not None:
+                    seeds_cells = seeds_cells * np.clip(soil_cells, 0.0, 1.0)
+                seeds_cells = retain * seeds_cells
+                # Scatter-add into pop.seed_bank at sampled locations
+                for ci in range(C):
+                    j = int(self.sample_j[ci]); i = int(self.sample_i[ci])
+                    pop.seed_bank[j, i] = np.clip(pop.seed_bank[j, i] + seeds_cells[ci], 0.0, bank_max)
+        except Exception:
+            pass
+
         # Reset daily buffers (energy and, partially, stress)
         self.indiv_E_day[:] = 0.0
         # Stress relief: if soil >= tol for an individual, reduce counter

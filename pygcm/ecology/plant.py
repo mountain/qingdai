@@ -5,6 +5,7 @@ from enum import Enum, auto
 from typing import Optional, Dict
 
 import numpy as np
+import os
 
 from .genes import Genes
 
@@ -24,6 +25,8 @@ class PlantReport:
     state: PlantState
     transitioned_to: Optional[PlantState] = None
     seed_count: int = 0
+    # Optional: daily reflectance bands R_b (shape [NB]) when band inputs are provided
+    reflectance_bands: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -74,6 +77,55 @@ class Plant:
         if soil_water_index is not None:
             if float(soil_water_index) < float(self.genes.drought_tolerance):
                 self.water_stress_days += float(dt_seconds) / 86400.0
+
+    def update_substep_bands(
+        self,
+        I_bands: np.ndarray,
+        A_b_genotype: np.ndarray,
+        dt_seconds: float,
+        delta_lambda: Optional[np.ndarray] = None,
+        light_availability: float = 1.0,
+        soil_water_index: Optional[float] = None,
+    ) -> None:
+        """
+        子步（谱带）能量累积接口（M1/M2）：
+          dE = Σ_b [ I_b[b] · A_b_eff[b] · Δλ_b ] · light_availability · dt
+        其中 A_b_eff = A_b_genotype · f_LAI(self.leaf_area)；f_LAI = 1−exp(-k_ext·LAI_proxy)
+        说明：
+          - 本个体未直接维护 LAI，使用 leaf_area 作为局地自遮蔽代理；k_ext 由 env QD_ECO_LAI_K_EXT 控制（默认 0.4）
+          - I_bands 单位建议为 W m^-2 nm^-1（或带平均的等效单位），Δλ_b 为带宽（nm）
+        """
+        if not self.is_alive():
+            return
+        # Bands and absorbance
+        I_b = np.asarray(I_bands, dtype=float).ravel()
+        A_b = np.clip(np.asarray(A_b_genotype, dtype=float).ravel(), 0.0, 1.0)
+        # Band widths
+        if delta_lambda is None:
+            dl = np.ones_like(I_b, dtype=float)
+        else:
+            dl = np.asarray(delta_lambda, dtype=float).ravel()
+            if dl.shape[0] != I_b.shape[0]:
+                # fallback to ones if mismatched
+                dl = np.ones_like(I_b, dtype=float)
+        # LAI proxy from leaf area (m^2) using simple Beer-Lambert-like factor
+        try:
+            k_ext = float(os.getenv("QD_ECO_LAI_K_EXT", "0.4"))
+        except Exception:
+            k_ext = 0.4
+        LAI_proxy = max(0.0, float(self.leaf_area))
+        f_LAI = 1.0 - np.exp(-k_ext * LAI_proxy)
+        A_eff = np.clip(A_b * f_LAI, 0.0, 1.0)
+        # Energy increment
+        lv = float(max(0.0, light_availability))
+        dt = float(dt_seconds)
+        dE = float(np.sum(I_b * A_eff * dl)) * lv * dt
+        if dE > 0.0:
+            self._E_day_buffer += dE
+        # Water stress accumulation
+        if soil_water_index is not None:
+            if float(soil_water_index) < float(self.genes.drought_tolerance):
+                self.water_stress_days += dt / 86400.0
 
     def _maybe_transition(self, Ts_day: float, day_length_hours: float) -> Optional[PlantState]:
         """
@@ -147,24 +199,83 @@ class Plant:
         Ts_day: float,
         day_length_hours: float,
         soil_water_index: float,
-        I_bands_weighted_scalar: float,
+        I_bands_weighted_scalar: Optional[float] = None,
+        *,
+        I_bands: Optional[np.ndarray] = None,
+        A_b_genotype: Optional[np.ndarray] = None,
+        delta_lambda: Optional[np.ndarray] = None,
+        light_availability: float = 1.0,
     ) -> PlantReport:
         """
         执行“日级慢路径”：
         - 状态机转换（基于 GDD/水分胁迫/寿命）
         - 能量投资与几何属性更新（height/leaf_area）
-        - 返回最小日报（含当日能量、leaf_area、seed_count）
-        I_bands_weighted_scalar: 外部带积分（Σ I_b·A_b·Δλ）的等效日能量或其代理（已按日累计）
+        - 返回最小日报（含当日能量、leaf_area、seed_count、可选 R_b）
+
+        计算能量优先级：
+        1) 若提供 I_bands（W m^-2 nm^-1）、A_b_genotype（[NB]）与 Δλ_b（nm），则按带积分：
+              E_banded = Σ_b I_b[b] · A_eff[b] · Δλ_b · light_availability
+           其中 A_eff = A_b_genotype · f_LAI(leaf_area)，f_LAI = 1−exp(−k_ext·leaf_area)，k_ext=QD_ECO_LAI_K_EXT(默认0.4)
+        2) 叠加子步缓冲 self._E_day_buffer
+        3) 若 I_bands_weighted_scalar 提供（外部等效带积分代理），将其与 1)+2) 相加（容错取 0）
+
+        同时在提供 band 输入时输出当日 R_b=1−A_eff（限幅 [0,1]），便于日级诊断。
         """
         if not self.is_alive():
             return PlantReport(energy_gain=0.0, leaf_area=self.effective_leaf_area(), state=self.state)
 
         transitioned = self._maybe_transition(Ts_day, day_length_hours)
 
-        # 将子步累计的能量与外部提供的带积分代理合并（以外部为主，buffer 为补充）
-        E_gain_day = max(0.0, float(I_bands_weighted_scalar)) + max(0.0, float(self._E_day_buffer))
+        # 1) 带积分路径（可选）
+        E_banded = 0.0
+        R_b: Optional[np.ndarray] = None
+        if (I_bands is not None) and (A_b_genotype is not None):
+            I_b = np.asarray(I_bands, dtype=float).ravel()
+            A_b = np.clip(np.asarray(A_b_genotype, dtype=float).ravel(), 0.0, 1.0)
+            if delta_lambda is None:
+                dl = np.ones_like(I_b, dtype=float)
+            else:
+                dl = np.asarray(delta_lambda, dtype=float).ravel()
+                if dl.shape[0] != I_b.shape[0]:
+                    dl = np.ones_like(I_b, dtype=float)
+            # f_LAI from leaf_area（LAI proxy）
+            try:
+                k_ext = float(os.getenv("QD_ECO_LAI_K_EXT", "0.4"))
+            except Exception:
+                k_ext = 0.4
+            try:
+                fmin = float(os.getenv("QD_ECO_LAI_FMIN", "0.05"))
+            except Exception:
+                fmin = 0.05
+            LAI_proxy = max(0.0, float(self.leaf_area))
+            f_LAI = max(fmin, 1.0 - np.exp(-k_ext * LAI_proxy))
+            A_eff = np.clip(A_b * f_LAI, 0.0, 1.0)
+            try:
+                k_ext = float(os.getenv("QD_ECO_LAI_K_EXT", "0.4"))
+            except Exception:
+                k_ext = 0.4
+            try:
+                fmin = float(os.getenv("QD_ECO_LAI_FMIN", "0.05"))
+            except Exception:
+                fmin = 0.05
+            LAI_proxy = max(0.0, float(self.leaf_area))
+            f_LAI = max(fmin, 1.0 - np.exp(-k_ext * LAI_proxy))
+            A_eff = np.clip(A_b * f_LAI, 0.0, 1.0)
+            lv = float(max(0.0, light_availability))
+            E_banded = float(np.sum(I_b * A_eff * dl)) * lv
+            # 生成 R_b
+            R_b = np.clip(1.0 - A_eff, 0.0, 1.0)
+
+        # 2) 子步累积缓冲
+        E_buffer = max(0.0, float(self._E_day_buffer))
         # 清空缓冲
         self._E_day_buffer = 0.0
+
+        # 3) 外部等效代理（可选）
+        E_proxy = 0.0 if (I_bands_weighted_scalar is None) else max(0.0, float(I_bands_weighted_scalar))
+
+        # 当日总能量
+        E_gain_day = E_banded + E_buffer + E_proxy
 
         # 应用形态投资
         self._apply_allocation(E_gain_day)
@@ -190,4 +301,5 @@ class Plant:
             state=self.state,
             transitioned_to=transitioned,
             seed_count=seed_count,
+            reflectance_bands=R_b,
         )

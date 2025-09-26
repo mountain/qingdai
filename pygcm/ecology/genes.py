@@ -38,6 +38,7 @@ class Genes:
     drought_tolerance: float = 0.3
     gdd_germinate: float = 80.0
     lifespan_days: int = 365
+    provenance: Optional[str] = None
 
     @staticmethod
     def from_env(prefix: str = "QD_ECO_GENE_") -> "Genes":
@@ -87,6 +88,7 @@ class Genes:
             g.alloc_root /= s
             g.alloc_stem /= s
             g.alloc_leaf /= s
+        g.provenance = f"env:{prefix}"
         return g
 
 

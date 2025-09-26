@@ -136,7 +136,7 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
     """
     Save autosave checkpoint into data/:
       - data/restart_autosave.nc   (core model state via NetCDF)
-      - data/eco_autosave.npz      (ecology LAI & species weights, if available)
+      - data/eco_autosave.npz      (ecology extended state if available; fallback to LAI/species_weights)
       - data/species_autosave.json (light species info: weights; optional)
     """
     try:
@@ -155,22 +155,41 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
         print(f"[Autosave] Core state saved to '{autosave_nc}'")
     except Exception as e:
         print(f"[Autosave] NetCDF save failed: {e}")
-    # Ecology (lightweight)
+    # Ecology (extended if possible, fallback to legacy)
     try:
         if eco is not None and getattr(eco, "pop", None) is not None:
-            # Store total LAI map (land-only meaningful) and species weights
-            path_npz = os.path.join(data_dir, "eco_autosave.npz")
-            LAI_tot = eco.pop.total_LAI() if hasattr(eco.pop, "total_LAI") else getattr(eco.pop, "LAI", None)
-            w = np.asarray(getattr(eco.pop, "species_weights", []), dtype=float)
-            np.savez(path_npz, LAI=LAI_tot, species_weights=w)
-            # Optional light JSON for species info (weights only; genes exported elsewhere)
-            sp_json = os.path.join(data_dir, "species_autosave.json")
-            with open(sp_json, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"day": float(day_value), "species_weights": w.tolist()},
-                    f, ensure_ascii=False, indent=2
-                )
-            print(f"[Autosave] Ecology state saved to '{path_npz}'")
+            # Resolve autosave path (allow override by env)
+            path_env = os.getenv("QD_ECO_AUTOSAVE_PATH")
+            path_npz = path_env if path_env else os.path.join(data_dir, "eco_autosave.npz")
+            # Ensure directory exists for custom path
+            try:
+                os.makedirs(os.path.dirname(path_npz) or ".", exist_ok=True)
+            except Exception:
+                pass
+            # Prefer adapter's extended autosave (bands/weights/species reflectance), fallback to legacy LAI-only
+            ok = False
+            try:
+                if hasattr(eco, "save_autosave"):
+                    ok = bool(eco.save_autosave(path_npz, day_value=float(day_value)))
+            except Exception as _esa:
+                print(f"[Autosave] Ecology extended save failed (falling back): {_esa}")
+                ok = False
+            if not ok:
+                # Legacy fallback: LAI + species_weights + light JSON weights
+                LAI_tot = eco.pop.total_LAI() if hasattr(eco.pop, "total_LAI") else getattr(eco.pop, "LAI", None)
+                w = np.asarray(getattr(eco.pop, "species_weights", []), dtype=float)
+                np.savez(path_npz, LAI=LAI_tot, species_weights=w)
+                print(f"[Autosave] Ecology legacy state saved to '{path_npz}'")
+                # Optional light JSON for species weights (genes exported elsewhere)
+                try:
+                    sp_json = os.path.join(data_dir, "species_autosave.json")
+                    with open(sp_json, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {"day": float(day_value), "species_weights": w.tolist()},
+                            f, ensure_ascii=False, indent=2
+                        )
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[Autosave] Ecology save failed: {e}")
 
@@ -1335,7 +1354,21 @@ def main():
         print("tqdm not found, using simple print statements for progress.")
         iterator = time_steps
 
+    # Periodic autosave interval (planetary hours)
+    try:
+        _hours = float(os.getenv("QD_ECO_AUTOSAVE_EVERY_HOURS", "6"))
+        AUTOSAVE_INTERVAL_SECONDS = (_hours * (day_in_seconds / 24.0))
+        next_autosave_t = time_steps[0] + AUTOSAVE_INTERVAL_SECONDS
+    except Exception:
+        AUTOSAVE_INTERVAL_SECONDS = None
+        next_autosave_t = None
+
     for i, t in enumerate(iterator):
+        # Periodic autosave tick
+        if AUTOSAVE_ENABLED and (AUTOSAVE_INTERVAL_SECONDS is not None) and (next_autosave_t is not None) and (t >= next_autosave_t):
+            _autosave_hook()
+            next_autosave_t += AUTOSAVE_INTERVAL_SECONDS
+
         # 1. Physics Step
         # 1) Humidity-aware precipitation（混合方案，使用 P_cond + 动力再分配 + 可选地形强化）
         #    先计算地形增强因子（若有外部 elevation）
@@ -1393,6 +1426,21 @@ def main():
                             last_alpha_banded = np.clip(alpha_banded_daily, 0.0, 1.0).copy()
                             if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                                 print(f"[Ecology] Daily banded alpha updated from {Abands.shape[0]} bands.")
+                            # Optional: export genes snapshot daily (M3)
+                            try:
+                                if int(os.getenv("QD_ECO_GENES_EXPORT", "0")) == 1 and hasattr(eco, "export_genes"):
+                                    # Estimate day value at the completed daily boundary
+                                    day_value_est = float((t - accum_t_day) / day_in_seconds)
+                                    eco.export_genes(output_dir, day_value_est)
+                            except Exception:
+                                pass
+                    # Fallback/export genes even if band coupling disabled or failed
+                    if int(os.getenv("QD_ECO_GENES_EXPORT", "0")) == 1 and hasattr(eco, "export_genes"):
+                        try:
+                            day_value_est = float((t - accum_t_day) / day_in_seconds)
+                            eco.export_genes(output_dir, day_value_est)
+                        except Exception:
+                            pass
                 except Exception as _ed:
                     if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                         print(f"[Ecology] daily step skipped: {_ed}")
@@ -1810,11 +1858,22 @@ def main():
             # Ecology panel: always output (with placeholders if eco is None)
             try:
                 lai_map = None
+                ch_map = None
+                sd_maps = None
                 if eco is not None and getattr(eco, "pop", None) is not None:
                     try:
                         lai_map = eco.pop.LAI
                     except Exception:
                         lai_map = None
+                    # M2.5: canopy height and species density maps (optional diagnostics)
+                    try:
+                        ch_map = eco.pop.canopy_height_map()
+                    except Exception:
+                        ch_map = None
+                    try:
+                        sd_maps = eco.pop.species_density_maps()
+                    except Exception:
+                        sd_maps = None
 
                 # Ensure banded alpha available for panel (compute on the fly if not cached)
                 if last_alpha_banded is None and eco is not None:
@@ -1831,7 +1890,9 @@ def main():
                     grid, land_mask, t_days, output_dir,
                     lai=lai_map,
                     alpha_ecology=last_alpha_ecology_map,
-                    alpha_banded=(last_alpha_banded if band_ok else None)
+                    alpha_banded=(last_alpha_banded if band_ok else None),
+                    canopy_height=ch_map,
+                    species_density=sd_maps
                 )
                 # Optional: auto-open ecology panel on macOS at first plot
                 try:

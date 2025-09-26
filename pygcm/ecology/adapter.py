@@ -4,10 +4,12 @@ import os
 import json
 import numpy as np
 from dataclasses import dataclass
+import time
+import glob
 
 from .spectral import make_bands, band_weights_from_mode, default_leaf_reflectance
 from .population import PopulationManager
-from .genes import Genes, Peak, reflectance_from_genes
+from .genes import Genes, Peak, reflectance_from_genes, absorbance_from_genes
 
 
 @dataclass
@@ -56,6 +58,8 @@ class EcologyAdapter:
         self.R_leaf = default_leaf_reflectance(self.bands)  # [NB] in [0,1]
         # Precompute leaf scalar albedo under current weighting
         self.alpha_leaf_scalar = float(np.sum(self.R_leaf * self.w_b))
+        # Genotype absorbance cache (M1.5)
+        self._absorb_cache: dict[str, np.ndarray] = {}
         # Counters
         self._step_count = 0
 
@@ -92,7 +96,8 @@ class EcologyAdapter:
             # Allow per-species overrides via QD_ECO_SPECIES_{i}_*; fallback to default gene env (QD_ECO_GENE_*)
             try:
                 g = Genes.from_env(prefix=f"QD_ECO_SPECIES_{i}_")
-                R_i = reflectance_from_genes(self.bands, g)  # [NB]
+                A_i = self._absorb_from_genes_cached(g)  # [NB] in [0,1]
+                R_i = np.clip(1.0 - A_i, 0.0, 1.0)
                 if not np.all(np.isfinite(R_i)):
                     raise ValueError("non-finite R_leaf")
                 self.genes_list.append(g)
@@ -161,22 +166,61 @@ class EcologyAdapter:
 
     def export_genes(self, out_dir: str, day_value: float) -> None:
         """
-        Export current species gene table (with weights) to JSON for audit/visualization.
+        Export current species gene table (with weights) to JSON for audit/visualization and sharing.
         File: {out_dir}/genes_day_{day:.1f}.json
+
+        Schema v3 fields:
+          - schema_version: int
+          - source: string
+          - day: float (planetary days)
+          - bands: { nbands, lambda_centers_nm[], delta_lambda_nm[], lambda_edges_nm[] }
+          - band_weights: w_b[] (normalized)
+          - genes: [
+              {
+                index, identity, provenance,
+                alloc_root, alloc_stem, alloc_leaf,
+                leaf_area_per_energy,
+                drought_tolerance, gdd_germinate, lifespan_days,
+                peaks: [ { center_nm, sigma_nm, variance_nm2, height } ],
+                weight (optional)
+              }, ...
+            ]
         """
         try:
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"genes_day_{day_value:05.1f}.json")
             table = []
-            weights = None
+            # Species weights (if available)
             try:
                 weights = [float(x) for x in np.asarray(getattr(self.pop, "species_weights", []), dtype=float).tolist()]
             except Exception:
                 weights = None
+
             for i, g in enumerate(self.genes_list):
+                peaks = getattr(g, "absorption_peaks", []) or []
+                peaks_out = []
+                for pk in peaks:
+                    try:
+                        sigma = float(pk.width_nm)
+                        peaks_out.append({
+                            "center_nm": float(pk.center_nm),
+                            "sigma_nm": sigma,
+                            "variance_nm2": float(sigma * sigma),
+                            "height": float(pk.height),
+                        })
+                    except Exception:
+                        # Minimal fallback
+                        peaks_out.append({
+                            "center_nm": float(getattr(pk, "center_nm", 0.0)),
+                            "sigma_nm": float(getattr(pk, "width_nm", 0.0)),
+                            "variance_nm2": float(getattr(pk, "width_nm", 0.0)) ** 2,
+                            "height": float(getattr(pk, "height", 0.0)),
+                        })
+
                 entry = {
                     "index": i,
                     "identity": getattr(g, "identity", f"sp{i}"),
+                    "provenance": getattr(g, "provenance", None),
                     "alloc_root": float(getattr(g, "alloc_root", 0.0)),
                     "alloc_stem": float(getattr(g, "alloc_stem", 0.0)),
                     "alloc_leaf": float(getattr(g, "alloc_leaf", 0.0)),
@@ -184,18 +228,33 @@ class EcologyAdapter:
                     "drought_tolerance": float(getattr(g, "drought_tolerance", 0.0)),
                     "gdd_germinate": float(getattr(g, "gdd_germinate", 0.0)),
                     "lifespan_days": int(getattr(g, "lifespan_days", 0)),
-                    "peaks": [
-                        {"center_nm": float(pk.center_nm), "width_nm": float(pk.width_nm), "height": float(pk.height)}
-                        for pk in getattr(g, "absorption_peaks", []) or []
-                    ],
+                    "peaks_model": "gaussian",
+                    "peaks": peaks_out,
+                    # Embed band definitions per-gene to make the entry self-contained
+                    "lambda_centers_nm": [float(x) for x in np.asarray(self.bands.lambda_centers, dtype=float).tolist()],
+                    "delta_lambda_nm": [float(x) for x in np.asarray(self.bands.delta_lambda, dtype=float).tolist()],
+                    "lambda_edges_nm": [float(x) for x in np.asarray(self.bands.lambda_edges, dtype=float).tolist()],
                 }
                 if weights is not None and i < len(weights):
                     entry["weight"] = weights[i]
                 table.append(entry)
+
+            doc = {
+                "schema_version": 3,
+                "source": "PyGCM.EcologyAdapter.export_genes",
+                "day": float(day_value),
+                "bands": {
+                    "nbands": int(self.bands.nbands),
+                    "band_weights": [float(x) for x in np.asarray(self.w_b, dtype=float).tolist()]
+                },
+                "genes": table,
+            }
+
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"day": day_value, "nbands": int(self.bands.nbands), "genes": table}, f, ensure_ascii=False, indent=2)
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+
             if self._diag:
-                print(f"[Ecology] Genes exported: {path} (Ns={len(table)})")
+                print(f"[Ecology] Genes exported: {path} (Ns={len(table)}, schema=3)")
         except Exception as e:
             if self._diag:
                 print(f"[Ecology] Genes export failed: {e}")
@@ -318,3 +377,229 @@ class EcologyAdapter:
             return A, self._last_w_b
         except Exception:
             return None, None
+
+    # --- M1.5: Genotype absorbance cache helpers ---
+    def _absorb_from_genes_cached(self, g: Genes) -> np.ndarray:
+        """
+        Return band absorbance A_b[NB] for genes 'g' using cache keyed by
+        (identity, peaks, band centers). Falls back to compute if missing.
+        """
+        try:
+            peaks = getattr(g, "absorption_peaks", []) or []
+            pk_key = tuple((float(getattr(p, "center_nm", 0.0)),
+                            float(getattr(p, "width_nm", 0.0)),
+                            float(getattr(p, "height", 0.0))) for p in peaks)
+            lam_key = tuple(float(x) for x in np.asarray(self.bands.lambda_centers, dtype=float).ravel().tolist())
+            key = f"{getattr(g, 'identity', 'gene')}|{pk_key}|{lam_key}"
+        except Exception:
+            key = f"{id(g)}|{self.bands.nbands}"
+        A = self._absorb_cache.get(key)
+        if A is None:
+            try:
+                A = absorbance_from_genes(self.bands, g)
+                A = np.clip(np.asarray(A, dtype=float).ravel(), 0.0, 1.0)
+            except Exception:
+                # Fallback flat absorbance ~ 0.5
+                A = np.full((self.bands.nbands,), 0.5, dtype=float)
+            self._absorb_cache[key] = A
+        return A
+
+    # --- M1.5: Autosave / Load of extended ecology state ---
+    def save_autosave(self, path_npz: str, day_value: float | None = None) -> bool:
+        """
+        Save extended ecology state (LAI, species_weights, bands, weights, species reflectance)
+        into a single NPZ file with atomic replace and rolling backups.
+
+        Env (optional):
+          - QD_ECO_AUTOSAVE_KEEP (default 4): number of timestamped backups to keep
+        """
+        try:
+            data = {}
+            # Schema tag
+            data["schema_version"] = np.int32(1)
+            # Mandatory (backward compatibility)
+            if getattr(self, "pop", None) is not None:
+                LAI_src = getattr(self.pop, "LAI", None)
+                if LAI_src is None and hasattr(self.pop, "total_LAI"):
+                    LAI_src = self.pop.total_LAI()
+                data["LAI"] = np.asarray(LAI_src, dtype=float)
+                data["species_weights"] = np.asarray(getattr(self.pop, "species_weights", np.asarray([1.0])), dtype=float)
+            # Bands and weights
+            data["bands_lambda_edges"] = np.asarray(self.bands.lambda_edges, dtype=float)
+            data["bands_lambda_centers"] = np.asarray(self.bands.lambda_centers, dtype=float)
+            data["bands_delta_lambda"] = np.asarray(self.bands.delta_lambda, dtype=float)
+            data["w_b"] = np.asarray(self.w_b, dtype=float)
+            # Species reflectance (if available)
+            try:
+                if getattr(self.pop, "_species_R_leaf", None) is not None:
+                    data["R_species_nb"] = np.asarray(self.pop._species_R_leaf, dtype=float)
+            except Exception:
+                pass
+            # Optional: day stamp
+            if day_value is not None:
+                data["day_value"] = float(day_value)
+            # Params snapshot (for audit/troubleshooting; stored as string arrays)
+            try:
+                ps = {
+                    "QD_ECO_SUBSTEP_EVERY_NPHYS": os.getenv("QD_ECO_SUBSTEP_EVERY_NPHYS", "1"),
+                    "QD_ECO_LAI_ALBEDO_WEIGHT": os.getenv("QD_ECO_LAI_ALBEDO_WEIGHT", "1.0"),
+                    "QD_ECO_FEEDBACK_MODE": os.getenv("QD_ECO_FEEDBACK_MODE", "instant"),
+                    "QD_ECO_ALBEDO_COUPLE_FREQ": os.getenv("QD_ECO_ALBEDO_COUPLE_FREQ", "subdaily"),
+                    "QD_ECO_LIGHT_UPDATE_EVERY_HOURS": os.getenv("QD_ECO_LIGHT_UPDATE_EVERY_HOURS", "6"),
+                    "QD_ECO_LIGHT_RECOMPUTE_LAI_DELTA": os.getenv("QD_ECO_LIGHT_RECOMPUTE_LAI_DELTA", "0.05"),
+                    "QD_ECO_SEED_BANK_RETAIN": os.getenv("QD_ECO_SEED_BANK_RETAIN", "0.2"),
+                    "QD_ECO_SEED_BANK_MAX": os.getenv("QD_ECO_SEED_BANK_MAX", "1000"),
+                    "QD_ECO_SEED_GERMINATE_FRAC": os.getenv("QD_ECO_SEED_GERMINATE_FRAC", "0.1"),
+                    "QD_ECO_SEED_BANK_DECAY": os.getenv("QD_ECO_SEED_BANK_DECAY", "0.02"),
+                }
+                data["params_snapshot_keys"] = np.asarray(list(ps.keys()))
+                data["params_snapshot_vals"] = np.asarray(list(ps.values()))
+            except Exception:
+                pass
+            # RNG snapshot (best-effort; CPython RandomState only)
+            try:
+                rng_state = np.random.get_state()
+                data["rng_state_kind"] = np.asarray([rng_state[0]])
+                data["rng_state_values"] = np.asarray(rng_state[1])
+                data["rng_state_pos"] = np.asarray([rng_state[2]])
+                data["rng_state_has_gauss"] = np.asarray([rng_state[3]])
+                data["rng_state_cached_gaussian"] = np.asarray([rng_state[4]])
+            except Exception:
+                pass
+
+            # Prepare paths
+            out_dir = os.path.dirname(path_npz) or "."
+            base = os.path.basename(path_npz)
+            name, ext = os.path.splitext(base)
+            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            backup_path = os.path.join(out_dir, f"{name}_{ts}{ext}")
+            tmp_path = os.path.join(out_dir, f".{name}.tmp{ext}")
+
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Atomic write: write to tmp, fsync, then replace
+            try:
+                # np.savez doesn't expose fileno; open file handle ourselves
+                with open(tmp_path, "wb") as f:
+                    np.savez(f, **data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path_npz)
+            finally:
+                # Best-effort cleanup if tmp remains
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+
+            # Create a timestamped backup copy (best-effort)
+            try:
+                import shutil
+                shutil.copy2(path_npz, backup_path)
+            except Exception:
+                backup_path = None
+
+            # Rolling backup retention
+            try:
+                keep = int(os.getenv("QD_ECO_AUTOSAVE_KEEP", "4"))
+                pattern = os.path.join(out_dir, f"{name}_*{ext}")
+                files = sorted(glob.glob(pattern), key=lambda p: os.path.getmtime(p), reverse=True)
+                for old in files[keep:]:
+                    try:
+                        os.remove(old)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            if self._diag:
+                msg = f"[Ecology] Autosave+ written: {path_npz} (keys={list(data.keys())})"
+                if backup_path:
+                    msg += f"; backup={backup_path}"
+                print(msg)
+            return True
+        except Exception as e:
+            if self._diag:
+                print(f"[Ecology] Autosave+ save failed: {e}")
+            return False
+
+    def load_autosave(self, path_npz: str, *, on_mismatch: str = "fallback") -> bool:
+        """
+        Load extended ecology state. If bands length mismatches, we only restore LAI/species weights.
+        on_mismatch: 'fallback' | 'ignore' – behavior when advanced fields mismatch.
+        """
+        if getattr(self, "pop", None) is None:
+            return False
+        try:
+            data = np.load(path_npz)
+            LAI = np.asarray(data.get("LAI"))
+            w = np.asarray(data.get("species_weights"))
+            if LAI is None or LAI.ndim != 2 or w is None or w.ndim != 1:
+                if self._diag:
+                    print("[Ecology] Autosave+ malformed: require LAI (2D) and species_weights (1D).")
+                return False
+            # Restore LAI/species weights (like legacy helper)
+            pop = self.pop
+            pop.LAI = np.clip(LAI, 0.0, pop.params.lai_max)
+            S = int(w.size)
+            K = int(getattr(pop, "K", 1))
+            H, W = pop.shape
+            w = np.clip(w, 0.0, None)
+            ssum = float(np.sum(w))
+            pop.species_weights = (w / ssum) if ssum > 0 else np.full((S,), 1.0 / float(max(S, 1)), dtype=float)
+            pop.Ns = int(pop.species_weights.shape[0])
+            pop.LAI_layers_SK = np.zeros((pop.Ns, max(1, K), H, W), dtype=float)
+            for s_idx in range(pop.Ns):
+                frac_s = float(pop.species_weights[s_idx])
+                for k in range(max(1, K)):
+                    pop.LAI_layers_SK[s_idx, k, :, :] = frac_s * (pop.LAI / float(max(1, K)))
+            pop.LAI_layers = np.sum(pop.LAI_layers_SK, axis=0)
+
+            # Try to restore bands & reflectance if shapes compatible
+            centers = data.get("bands_lambda_centers")
+            R_species_nb = data.get("R_species_nb")
+            ok_adv = (centers is not None and len(centers) == self.bands.nbands and
+                      R_species_nb is not None and R_species_nb.shape[1] == self.bands.nbands)
+            if ok_adv:
+                try:
+                    pop.set_species_reflectance_bands(np.asarray(R_species_nb, dtype=float))
+                except Exception:
+                    ok_adv = False
+            elif self._diag and on_mismatch != "ignore":
+                print("[Ecology] Autosave+: advanced fields (bands/R_species) mismatched – restored base LAI/weights only.")
+            if self._diag:
+                sdiag = pop.summary()
+                print(f"[Ecology] Autosave+ loaded: LAI(min/mean/max)={sdiag['LAI_min']:.2f}/{sdiag['LAI_mean']:.2f}/{sdiag['LAI_max']:.2f}; "
+                      f"S={pop.Ns}, K={K}, advanced={'OK' if ok_adv else 'NO'}")
+            return True
+        except Exception as e:
+            if self._diag:
+                print(f"[Ecology] Autosave+ load failed: {e}")
+            return False
+
+    # --- M1.5: Genotype absorbance cache helpers ---
+    def _absorb_from_genes_cached(self, g: Genes) -> np.ndarray:
+        """
+        Return band absorbance A_b[NB] for genes 'g' using cache keyed by
+        (identity, peaks, band centers). Falls back to compute if missing.
+        """
+        try:
+            peaks = getattr(g, "absorption_peaks", []) or []
+            pk_key = tuple((float(getattr(p, "center_nm", 0.0)),
+                            float(getattr(p, "width_nm", 0.0)),
+                            float(getattr(p, "height", 0.0))) for p in peaks)
+            lam_key = tuple(float(x) for x in np.asarray(self.bands.lambda_centers, dtype=float).ravel().tolist())
+            key = f"{getattr(g, 'identity', 'gene')}|{pk_key}|{lam_key}"
+        except Exception:
+            key = f"{id(g)}|{self.bands.nbands}"
+        A = self._absorb_cache.get(key)
+        if A is None:
+            try:
+                A = absorbance_from_genes(self.bands, g)
+                A = np.clip(np.asarray(A, dtype=float).ravel(), 0.0, 1.0)
+            except Exception:
+                # Fallback flat absorbance ~ 0.5
+                A = np.full((self.bands.nbands,), 0.5, dtype=float)
+            self._absorb_cache[key] = A
+        return A

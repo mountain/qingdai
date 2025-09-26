@@ -117,7 +117,7 @@
 10. 快速自旋与重启（P013）：[docs/11-spin-up-and-restarts.md](./docs/11-spin-up-and-restarts.md)（详见 [projects/013](./projects/013-spin-up.md)）
 11. 开发者指南/代码架构与 API（P002 + 实现）：[docs/12-code-architecture-and-apis.md](./docs/12-code-architecture-and-apis.md)（参见 [projects/002](./projects/002-physics-core.md)）
 12. 地表水文与径流路由（P014）：[projects/014-surface-hydrology.md](./projects/014-surface-hydrology.md)（运行参数见 [docs/04-runtime-config.md](./docs/04-runtime-config.md) 第 10 节）
-13. 项目状态与进展对齐（2025‑09‑25）：[docs/STATUS-2025-09-25.md](./docs/STATUS-2025-09-25.md)
+13. 项目状态与进展对齐（2025‑09‑26）：[docs/STATUS-2025-09-26.md](./docs/STATUS-2025-09-26.md)
 
 ## 🤝 贡献
 

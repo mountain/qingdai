@@ -168,6 +168,66 @@ def default_leaf_reflectance(bands: SpectralBands) -> np.ndarray:
     return _greenish_leaf_reflectance(bands.lambda_centers)
 
 
+def absorbance_from_genes(bands: SpectralBands, genes) -> np.ndarray:
+    """
+    Compute band absorbance A_b[NB] in [0,1] from a gene's absorption_peaks definition.
+
+    Expected genes.absorption_peaks: iterable of peaks where each peak has
+      - center_nm: float (peak center wavelength, nm)
+      - width_nm:  float (Gaussian width parameter, nm; interpreted as sigma; if FWHM is provided upstream,
+                           consider converting before; here we assume sigma directly)
+      - height:    float in [0,1] (peak amplitude)
+    The final absorbance is clipped to [0,1]. If no peaks provided, fall back to:
+      A_b = 1 - default_leaf_reflectance(bands)
+    """
+    NB = int(getattr(bands, "nbands", 1))
+    lam = np.asarray(getattr(bands, "lambda_centers", np.linspace(400.0, 700.0, NB)), dtype=float).ravel()
+    if lam.shape[0] != NB:
+        lam = np.linspace(float(lam.min(initial=400.0)), float(lam.max(initial=700.0)), NB)
+
+    # Try read peaks from genes
+    peaks = []
+    try:
+        peaks = getattr(genes, "absorption_peaks", []) or []
+    except Exception:
+        peaks = []
+
+    if not peaks:
+        # Fallback: absorption is 1 - default reflectance
+        R_leaf = default_leaf_reflectance(bands)
+        return np.clip(1.0 - np.asarray(R_leaf, dtype=float).ravel(), 0.0, 1.0)
+
+    A = np.zeros((NB,), dtype=float)
+
+    def _get_attr(obj, name: str, default: float) -> float:
+        # support dataclass-like, SimpleNamespace, dict, or tuple/list
+        if hasattr(obj, name):
+            try:
+                return float(getattr(obj, name))
+            except Exception:
+                pass
+        if isinstance(obj, dict) and name in obj:
+            try:
+                return float(obj[name])
+            except Exception:
+                pass
+        return float(default)
+
+    for pk in peaks:
+        c = _get_attr(pk, "center_nm", 550.0)
+        w = _get_attr(pk, "width_nm", 50.0)
+        h = _get_attr(pk, "height", 0.5)
+        # Guard values
+        w = max(1e-3, float(w))
+        h = float(np.clip(h, 0.0, 1.0))
+        # Gaussian peak (sigma = width_nm)
+        A += h * np.exp(-((lam - c) ** 2) / (2.0 * w ** 2))
+
+    # Clip to [0,1]
+    A = np.clip(A, 0.0, 1.0)
+    return A
+
+
 # --------- Spectral physics: main-sequence effective temperatures and blackbody bands ---------
 
 _T_SUN = 5778.0  # K

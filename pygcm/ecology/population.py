@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import numpy as np
 from dataclasses import dataclass
+from .spectral import absorbance_from_genes
 
 
 @dataclass
@@ -54,6 +55,21 @@ class PopulationManager:
         # Daily energy buffer (proxy J-equivalents)
         self.E_day = np.zeros(self.shape, dtype=float)
         self._diag = diag
+        # --- M2: canopy cache and recompute policy ---
+        self._hours_accum: float = 0.0
+        try:
+            self._light_update_every_hours = float(os.getenv("QD_ECO_LIGHT_UPDATE_EVERY_HOURS", "6"))
+        except Exception:
+            self._light_update_every_hours = 6.0
+        try:
+            self._lai_recompute_delta = float(os.getenv("QD_ECO_LIGHT_RECOMPUTE_LAI_DELTA", "0.05"))
+        except Exception:
+            self._lai_recompute_delta = 0.05
+        self._canopy_f_cached: np.ndarray | None = None
+        self._lai_snapshot: np.ndarray = self.total_LAI().copy()
+        self._next_recompute_hours: float = self._light_update_every_hours
+        # --- M1: genotype absorbance cache (genes → A_b) ---
+        self._genotype_absorb_cache: dict[str, np.ndarray] = {}
 
         # Cohort layers (K) scaffold: optional vertical layering; extend to species S×K
         try:
@@ -149,6 +165,8 @@ class PopulationManager:
             self.seedling_lai = 0.02
         # Age map (days since establishment); starts at 0, increments daily where LAI>0
         self.age_days = np.zeros(self.shape, dtype=float)
+        # Seed bank (M3): per-cell seed reservoir (arb. units), retained/germinated daily
+        self.seed_bank = np.zeros(self.shape, dtype=float)
         # Spread gating map (e.g., from soil moisture); initialize to land mask
         self._spread_gate = self.land.astype(float)
 
@@ -231,22 +249,41 @@ class PopulationManager:
                     out.append("diffusion")
         self.species_modes = out
 
-    def step_subdaily(self, isr_total: np.ndarray, dt_seconds: float) -> None:
+    def step_subdaily(self, isr_total: np.ndarray, dt_seconds: float, *, return_bands: bool = False, soil_ref: float = 0.20) -> np.ndarray | None:
         """
         Accumulate daily energy buffer from incoming shortwave proxy.
         Use simple proportionality: dE = isr_total * dt.
+
+        When return_bands=True, also返回 A_b^surface（NB×lat×lon），NB 取自物种反射缓存的列数；
+        若未设置物种反射缓存，则返回 None（由上层按需调用 get_surface_albedo_bands）。
         """
         if isr_total is None:
-            return
+            return None
         # Ensure shapes match
         if isr_total.shape != self.shape:
             isr = np.full(self.shape, float(np.nan))
-            # broadcast center if 1D? Keep simple: clip to mean
             isr[:] = float(np.nanmean(isr_total))
         else:
             isr = isr_total
         dE = np.nan_to_num(isr) * float(dt_seconds)
         self.E_day += dE
+
+        # Update canopy cache clock and recompute policy
+        self._hours_accum += float(dt_seconds) / 3600.0
+        if self._should_recompute_canopy():
+            self._recompute_canopy_cache()
+            self._lai_snapshot = self.total_LAI().copy()
+            self._next_recompute_hours = self._hours_accum + self._light_update_every_hours
+
+        if return_bands:
+            if getattr(self, "_species_R_leaf", None) is None:
+                return None
+            nb = int(self._species_R_leaf.shape[1])
+            try:
+                return self.get_surface_albedo_bands(nb, soil_ref=soil_ref)
+            except Exception:
+                return None
+        return None
 
     def total_LAI(self) -> np.ndarray:
         """Return total LAI (sum over species and layers)."""
@@ -507,6 +544,54 @@ class PopulationManager:
         except Exception:
             pass
 
+        # Germination & decay of seed bank (M3)
+        try:
+            germ_frac = float(os.getenv("QD_ECO_SEED_GERMINATE_FRAC", "0.10"))
+        except Exception:
+            germ_frac = 0.10
+        try:
+            decay = float(os.getenv("QD_ECO_SEED_BANK_DECAY", "0.02"))
+        except Exception:
+            decay = 0.02
+        # Soil-gated germination
+        gate = getattr(self, "_spread_gate", None)
+        if gate is None:
+            gate = self.land.astype(float)
+        else:
+            gate = np.where(self.land, np.clip(gate, 0.0, 1.0), 0.0)
+        seeds_to_germ = np.maximum(0.0, germ_frac) * self.seed_bank * gate
+        # Convert to seedling LAI at lowest layer, per-species by weights
+        try:
+            s_lai = float(os.getenv("QD_ECO_SEEDLING_LAI", "0.02"))
+        except Exception:
+            s_lai = 0.02
+        if getattr(self, "LAI_layers_SK", None) is not None:
+            try:
+                S = int(getattr(self, "Ns", 1))
+                w = np.asarray(getattr(self, "species_weights", np.ones((S,), dtype=float)), dtype=float)
+                w = w / (np.sum(w) + 1e-12)
+            except Exception:
+                S = 1
+                w = np.asarray([1.0], dtype=float)
+            add_total = s_lai * seeds_to_germ  # [lat,lon]
+            for s in range(S):
+                add_s = w[s] * add_total
+                self.LAI_layers_SK[s, 0, self.land] = np.clip(
+                    self.LAI_layers_SK[s, 0, self.land] + add_s[self.land],
+                    0.0, self.params.lai_max
+                )
+            # refresh aggregates
+            self.LAI_layers = np.sum(self.LAI_layers_SK, axis=0)
+            self.LAI = np.sum(self.LAI_layers, axis=0)
+        else:
+            self.LAI[self.land] = np.clip(self.LAI[self.land] + s_lai * seeds_to_germ[self.land], 0.0, self.params.lai_max)
+        # Seed bank decay after germination
+        try:
+            self.seed_bank = np.maximum(0.0, self.seed_bank - seeds_to_germ)
+            self.seed_bank *= max(0.0, (1.0 - decay))
+        except Exception:
+            pass
+
         # Reset daily energy buffer
         self.E_day[:] = 0.0
 
@@ -664,6 +749,19 @@ class PopulationManager:
 
         # Effective dispersal coefficient
         r_eff = r0 * (1.0 - np.exp(-Seeds / seed_scale))
+        # Local seed-bank retention (M3): retain a fraction of produced seeds in current cell
+        try:
+            retain = float(os.getenv("QD_ECO_SEED_BANK_RETAIN", "0.2"))
+        except Exception:
+            retain = 0.2
+        try:
+            bank_max = float(os.getenv("QD_ECO_SEED_BANK_MAX", "1000.0"))
+        except Exception:
+            bank_max = 1000.0
+        try:
+            self.seed_bank = np.clip(self.seed_bank + retain * Seeds, 0.0, bank_max)
+        except Exception:
+            pass
         # Optional soil gating of seed dispersal rate
         gate = getattr(self, "_spread_gate", None)
         if gate is None:
@@ -734,13 +832,12 @@ class PopulationManager:
         """
         Return f(LAI) in [0,1] used to scale leaf reflectance to canopy-scale reflectance.
         Using a saturating law: f(LAI) = 1 - exp(-k * LAI)
+        Employ cached value if可用，按策略周期或LAI变化量触发重算。
         """
-        k = self.params.k_canopy
-        LAI_tot = self.total_LAI()
-        f = 1.0 - np.exp(-k * np.maximum(LAI_tot, 0.0))
-        # Keep only land; ocean remains NaN to let caller blend selectively
+        if self._canopy_f_cached is None:
+            self._recompute_canopy_cache()
         out = np.full(self.shape, np.nan, dtype=float)
-        out[self.land] = f[self.land]
+        out[self.land] = self._canopy_f_cached[self.land]
         return out
 
     # M4: supply species leaf reflectance per band from adapter/genes (shape [Ns, NB])
@@ -792,6 +889,59 @@ class PopulationManager:
             Z = np.full((h, w), np.nan, dtype=float)
             Z[self.land] = np.clip(Ab[self.land], 0.0, 1.0)
             A[b, :, :] = Z
+        return A
+
+    # --- M2 helpers: canopy cache policy ---
+    def _should_recompute_canopy(self) -> bool:
+        try:
+            if self._canopy_f_cached is None:
+                return True
+            # Time-based
+            if self._hours_accum >= self._next_recompute_hours:
+                return True
+            # LAI change threshold
+            lai_now = self.total_LAI()
+            delta = np.nanmean(np.abs(lai_now - self._lai_snapshot))
+            base = np.nanmean(np.maximum(self._lai_snapshot, 1e-6))
+            ratio = (delta / base) if base > 0 else delta
+            return bool(ratio >= self._lai_recompute_delta)
+        except Exception:
+            return True
+
+    def _recompute_canopy_cache(self) -> None:
+        k = self.params.k_canopy
+        LAI_tot = self.total_LAI()
+        f = 1.0 - np.exp(-k * np.maximum(LAI_tot, 0.0))
+        self._canopy_f_cached = f
+
+    def lai_delta_ratio(self) -> float:
+        lai_now = self.total_LAI()
+        delta = np.nanmean(np.abs(lai_now - self._lai_snapshot))
+        base = np.nanmean(np.maximum(self._lai_snapshot, 1e-6))
+        return float((delta / base) if base > 0 else delta)
+
+    # --- M1: genotype absorbance cache API ---
+    def get_absorbance_for_genes(self, bands, genes) -> np.ndarray:
+        """
+        返回给定 Genes 在指定 bands 下的 A_b（缓存）。
+        """
+        try:
+            peaks = getattr(genes, "absorption_peaks", []) or []
+            pk_key = tuple((float(getattr(p, "center_nm", 0.0)),
+                            float(getattr(p, "width_nm", 0.0)),
+                            float(getattr(p, "height", 0.0))) for p in peaks)
+            lam_key = tuple(float(x) for x in np.asarray(bands.lambda_centers, dtype=float).ravel().tolist())
+            key = f"{getattr(genes, 'identity', 'gene')}|{pk_key}|{lam_key}"
+        except Exception:
+            key = f"{id(genes)}|{getattr(bands, 'nbands', 0)}"
+        A = self._genotype_absorb_cache.get(key)
+        if A is None:
+            try:
+                A = absorbance_from_genes(bands, genes)
+                A = np.clip(np.asarray(A, dtype=float).ravel(), 0.0, 1.0)
+            except Exception:
+                A = np.full((getattr(bands, "nbands", 1),), 0.5, dtype=float)
+            self._genotype_absorb_cache[key] = A
         return A
 
     def summary(self) -> dict:
