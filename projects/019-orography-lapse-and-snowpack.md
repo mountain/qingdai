@@ -50,12 +50,37 @@
 
 ---
 
+## 1A. 冰盖掩膜与生态/水文协同（更新）
+
+为统一“陆上冰相（glacier/ice cap）”在各模块的处理，本项目引入运行期冰盖掩膜并规定跨模块行为：
+
+- 冰盖掩膜定义  
+  `glacier_mask = (land=1) ∧ (C_snow ≥ QD_GLACIER_FRAC ∨ SWE ≥ QD_GLACIER_SWE_MM)`  
+  其中 `QD_GLACIER_FRAC` 默认 0.60，`QD_GLACIER_SWE_MM` 默认 50 mm（1 mm ≡ 1 kg·m⁻²）。
+
+- 水文与路由  
+  • 冰盖像元上的“雨”视为冻结沉积：`SWE ← SWE + P_rain_glacier·dt`，不进入陆地桶。  
+  • 冰盖融水不入桶，直接作为“下游源项”进入路由（可理解为“冰下管网”流出）；非冰盖区域仍沿“雨/融水入桶 → 线性径流 → 路由”的既有路径。  
+  • 保持水量守恒核算一致：`R_flux_total = R_flux_bucket(non-glacier) + melt_flux(glacier)`。
+
+- 能量与可视  
+  • 反照率合成时，冰盖像元由雪/冰高反照率主导；生态反照率不在冰盖处混入（保持高 α）。  
+  • TrueColor 建议启用 `QD_TRUECOLOR_SNOW_BY_SWE=1`，并以 `QD_SNOW_COVER_FRAC/QD_SNOW_VIS_ALPHA` 控制雪可视层。
+
+- 生态（性能与一致性）  
+  • 冰盖处 `soil_idx=0`、`LAI=0`；个体池（IndividualPool）在冰盖处禁用采样（支持 `set_active_mask` 或回退覆盖 `land_mask`），以降低计算成本并与环境假设一致。
+
+环境变量（新增）  
+- `QD_GLACIER_FRAC`（默认 0.60）：冰盖判定的雪覆盖阈值 C_snow（0..1）  
+- `QD_GLACIER_SWE_MM`（默认 50.0）：冰盖判定的 SWE 阈值（mm）
+
 ## 2. 设计与集成（代码层）
 
 2.1 Lapse Rate（海拔温度递减）
 - 位置：scripts/run_simulation（或 pygcm/physics 统一函数）
 - 输入：T_a、T_s、elevation、Γ（K/km）、Γ_s（可=Γ）
 - 输出：T_hat_a = T_a − Γ·ΔH_km；T_hat_s 类似（用于雪反照率/可视化）
+- 几何约束（新增）：用于 lapse/雪线/相态的“有效海拔” H_eff = min(H_bedrock + H_ice_eff, QD_LAND_ELEV_MAX_M)。其中 H_ice_eff = min(H_ice_geom, H_ice_polar_cap)；极区（|φ| ≥ QD_POLAR_LAT_THRESH）施加 H_ice_polar_cap ≤ QD_POLAR_ICE_THICK_MAX_M。H_ice_geom 可由 SWE 近似换算为几何厚度 h_snow ≈ SWE_mm·1e-3·ρ_w/ρ_snow（ρ_snow≈300 kg/m³）并与未来“大陆冰盖厚度”字段（若存在）叠加。
 - 保护：与 QD_T_FLOOR 一致的温度地板
 
 2.2 相态分配（雪/雨混合）
@@ -139,6 +164,11 @@
 - QD_PLOT_SNOWLINE（1）
 - QD_TRUECOLOR_SNOW_BY_SWE（1）
 - 打印间隔（沿用 QD_PLOT_EVERY_DAYS 或独立 SnowDiag_EVERY）
+
+几何上限与冰盖厚度（新增）
+- QD_LAND_ELEV_MAX_M（默认 10000）：冰雪/冰盖叠加后的陆地“有效海拔”上限（m）
+- QD_POLAR_ICE_THICK_MAX_M（默认 4500）：极地（|φ| ≥ 阈值）冰川/冰盖厚度上限（m）
+- QD_POLAR_LAT_THRESH（默认 60）：极地纬度阈值（度）
 
 ---
 

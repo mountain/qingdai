@@ -87,6 +87,14 @@
 3) 输出 EcologyDailyReport、更新日末 A_b^surface（用于诊断与可视化）
 4) 清空当日缓冲（个体累计能量/胁迫），进入新日
 
+2.3 冰盖掩膜与生态屏蔽（新增）
+- 来自 P019 的 `glacier_mask` 定义：`glacier_mask = (land=1) ∧ (C_snow ≥ QD_GLACIER_FRAC ∨ SWE ≥ QD_GLACIER_SWE_MM)`。默认 `QD_GLACIER_FRAC=0.60`，`QD_GLACIER_SWE_MM=50 mm`。  
+- 时级与日级的生态耦合在冰盖处的处理：
+  - `soil_idx` 在冰盖像元强制置 0，抑制 LAI 增长；日末将冰盖像元的 LAI 置 0 兜底。  
+  - IndividualPool（个体抽样）在冰盖处禁用采样：适配器或个体池应支持 `set_active_mask(active_mask=(land=1 ∧ ¬glacier))`；若无该 API，则回退设置 `indiv.land_mask`。  
+  - 生态反照率回写（标量/带化）在冰盖处跳过混入，保持雪/冰高反照率主导。  
+- 目的：冰盖区域生命稀少，关闭个体采样与生长计算可显著降低开销，并与水文/能量路径一致（冰盖雨沉积入 SWE、融水直达路由）。
+
 3. 资源竞争算法（与 v2 相同，增加“时级策略”）
 
 3.1 光竞争：分层光照衰减（类 Beer‑Lambert）

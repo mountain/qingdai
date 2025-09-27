@@ -55,6 +55,18 @@
 
 建议：将 `T̂_a` 用于“降水相态与融雪”，`T̂_s` 用于“积雪反照率与可视化雪层”。
 
+几何与边界约束（新增）
+- 有效地形高度上限：为避免不现实的极端地形，采用 `H_eff = min(H_bedrock + h_ice_eff, QD_LAND_ELEV_MAX_M)`，默认 `QD_LAND_ELEV_MAX_M≈10000 m`。  
+- 极区冰厚上限：在极区（`|φ| ≥ QD_POLAR_LAT_THRESH`，默认 60°）对雪/冰几何厚度采用 `h_ice_eff ≤ QD_POLAR_ICE_THICK_MAX_M`（默认 ≈4500 m），代表近地球的极冠厚度上限。  
+- 几何换算：雪的几何厚度 `h_snow ≈ SWE / QD_RHO_SNOW`（默认 `QD_RHO_SNOW≈300 kg·m⁻³`），用于上式中的 `h_ice_eff` 计算。
+
+物理上限与几何约束（新增）
+- 陆地有效海拔上限：当考虑冰雪/冰盖叠加时，用于 lapse/snowline 的“有效海拔”定义为
+  H_eff = min(H_bedrock + H_ice_eff, QD_LAND_ELEV_MAX_M)。
+  其中 H_ice_eff 可由（i）雪被厚度（SWE 转换为几何厚度，近似 h_snow ≈ SWE_mm·1e-3·ρ_w/ρ_snow，ρ_snow 典型 300 kg/m³）与（ii）未来可能的“大陆冰盖厚度”字段（若存在）组成。
+- 极地冰川厚度上限：在极区（|φ| ≥ QD_POLAR_LAT_THRESH）对冰盖/冰川几何厚度实施上限 H_ice_eff ≤ QD_POLAR_ICE_THICK_MAX_M（默认采用与地球同量级的上限，见 §6）。
+- 以上约束确保“冰雪叠加后的陆地海拔”不超过 10 km，且极地冰川/冰盖厚度不超过地球量级上限，用于 lapse/雪线与相态判定的一致性几何基准。
+
 ---
 
 ## 2. 雪线与降水相态分配
@@ -138,6 +150,11 @@ TrueColor 可视化：与 `QD_TRUECOLOR_SNOW_BY_TS` 一致，可切换为“按 
    - `SWE ← SWE + P_snow·dt − M_snow·dt`（M_snow 由 DDF 或常数）
    - `W_land ← W_land + (1−φ_fast)·M_snow·dt`；快流分量 → 路由输入缓存
    - 诊断：`⟨SWE⟩`、`⟨P_snow⟩`、`⟨M_snow⟩`
+   - 冰盖掩膜与分流（新增）：定义陆地冰盖掩膜  
+     `glacier_mask = (land=1) ∧ (C_snow ≥ QD_GLACIER_FRAC ∨ SWE ≥ QD_GLACIER_SWE_MM)`；其中 `QD_GLACIER_FRAC` 默认 0.60、`QD_GLACIER_SWE_MM` 默认 50 mm。  
+     • 冰盖像元上的“雨”视为冻结沉积：`SWE ← SWE + P_rain_glacier·dt`，不进入陆地桶。  
+     • 冰盖融水不入桶，直接作为“下游源项”进入路由（可理解为冰下管网）；非冰盖像元仍采用“入桶→线性径流→路由”的路径。  
+     • 生态掩膜：冰盖像元 `soil_idx=0`、`LAI=0`，并在个体抽样（IndividualPool）与日级聚合中跳过冰盖像元以节省计算。
 5) 反照率合成：计算 `C_snow(SWE)` → `α_surface_eff` 并与云/海冰合成总反照率（docs/06）
 6) 能量步：短/长波 + SH/LH；海洋步（docs/07/11）
 7) 水文步：陆地桶/径流（docs/09）；到水文步长时路由（docs/14）
@@ -177,6 +194,11 @@ TrueColor 可视化：与 `QD_TRUECOLOR_SNOW_BY_TS` 一致，可切换为“按 
 可视化与诊断
 - QD_PLOT_SNOWLINE（默认 1）：绘制雪线诊断（见 7 节）
 - QD_TRUECOLOR_SNOW_BY_SWE（默认 1）：TrueColor 按 SWE 渲染雪
+
+几何上限与冰盖厚度（新增）
+- QD_LAND_ELEV_MAX_M（默认 10000）：冰雪/冰盖叠加后的陆地“有效海拔”上限（m），用于 lapse/snowline/相态计算。
+- QD_POLAR_ICE_THICK_MAX_M（默认 4500）：极地（|φ| ≥ 阈值）冰川/冰盖厚度上限（m），用于计算 H_ice_eff。
+- QD_POLAR_LAT_THRESH（默认 60）：极地纬度阈值（deg），用于应用极地厚度上限。
 
 ---
 

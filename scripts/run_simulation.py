@@ -23,7 +23,15 @@ from pygcm.forcing import ThermalForcing
 from pygcm.dynamics import SpectralModel
 from pygcm.topography import create_land_sea_mask, generate_base_properties, load_topography_from_netcdf
 from pygcm.physics import diagnose_precipitation, diagnose_precipitation_hybrid, parameterize_cloud_cover, calculate_dynamic_albedo, cloud_from_precip, compute_orographic_factor
-from pygcm.hydrology import get_hydrology_params_from_env, partition_precip_phase, snow_step, update_land_bucket, diagnose_water_closure
+from pygcm.hydrology import (
+    get_hydrology_params_from_env,
+    partition_precip_phase,
+    partition_precip_phase_smooth,
+    snow_step,
+    snowpack_step,
+    update_land_bucket,
+    diagnose_water_closure,
+)
 from pygcm.routing import RiverRouting
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
@@ -47,12 +55,13 @@ except Exception:
 
 # --- Restart I/O (NetCDF) and Initialization Helpers ---
 
-def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None, t_seconds: float | None = None):
+def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None, C_snow=None, t_seconds: float | None = None):
     """
     Save minimal prognostic state to a NetCDF restart file.
     Includes: lat/lon coords, u/v/h, T_s, cloud_cover, q (if exists), h_ice (if exists),
               ocean state (uo/vo/eta/Ts if ocean provided),
-              hydrology reservoirs (W_land, S_snow) if provided.
+              hydrology reservoirs (W_land, S_snow) if provided,
+              snow optical coverage C_snow (optional; derived from SWE, persisted for viz continuity).
     """
     from netCDF4 import Dataset
     import numpy as np
@@ -88,9 +97,10 @@ def save_restart(path, grid, gcm, ocean, land_mask, W_land=None, S_snow=None, t_
             wvar("eta", getattr(ocean, "eta", None))
             wvar("Ts", getattr(ocean, "Ts", None))
 
-        # Hydrology
+        # Hydrology / Cryo
         wvar("W_land", W_land)
         wvar("S_snow", S_snow)
+        wvar("C_snow", C_snow)
 
         # Masks for reference
         wvar("land_mask", land_mask)
@@ -158,7 +168,7 @@ def load_restart(path):
         out["lat"] = ds.variables["lat"][:].data
         out["lon"] = ds.variables["lon"][:].data
         for name in ["u", "v", "h", "T_s", "cloud_cover", "q", "h_ice",
-                     "uo", "vo", "eta", "Ts", "W_land", "S_snow", "land_mask"]:
+                     "uo", "vo", "eta", "Ts", "W_land", "S_snow", "C_snow", "land_mask"]:
             out[name] = rvar(name)
         # Optional astronomical epoch
         try:
@@ -249,7 +259,10 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
             t_sec = float(day_value) * (2 * np.pi / constants.PLANET_OMEGA)
         except Exception:
             t_sec = 0.0
-        save_restart(autosave_nc, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow, t_seconds=t_sec)
+        save_restart(
+            autosave_nc, grid, gcm, ocean, land_mask,
+            W_land=W_land, S_snow=S_snow, C_snow=getattr(gcm, "C_snow_map_last", None), t_seconds=t_sec
+        )
         print(f"[Autosave] Core state saved to '{autosave_nc}' (standardized atmosphere.nc)")
     except Exception as e:
         print(f"[Autosave] NetCDF save failed: {e}")
@@ -544,6 +557,21 @@ def plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=None, eco=
     ice_frac_thresh = float(os.getenv("QD_TRUECOLOR_ICE_FRAC", "0.15"))
     sea_ice_mask = (land_mask == 0) & (ice_frac >= ice_frac_thresh)
     rgb_map[sea_ice_mask] = ice_color
+
+    # Land snow (from SWE/C_snow) overlay — render snow cover fraction on land
+    try:
+        if int(os.getenv("QD_TRUECOLOR_SNOW_BY_SWE", "1")) == 1 and hasattr(gcm, "C_snow_map_last"):
+            C = np.nan_to_num(getattr(gcm, "C_snow_map_last"), nan=0.0)
+            frac_thr = float(os.getenv("QD_SNOW_COVER_FRAC", "0.20"))  # coverage threshold
+            vis_alpha = float(os.getenv("QD_SNOW_VIS_ALPHA", "0.60"))   # max blend strength
+            land_snow_mask = (land_mask == 1) & (C >= frac_thr)
+            # Scale alpha by coverage for smoother look
+            alpha_map = vis_alpha * np.clip(C, 0.0, 1.0)
+            alpha3 = alpha_map[..., None]
+            lm3 = land_snow_mask[..., None]
+            rgb_map = np.where(lm3, rgb_map * (1.0 - alpha3) + ice_color * alpha3, rgb_map)
+    except Exception:
+        pass
 
     # Vegetation coloring (optional TrueColor vegetation overlay)
     try:
@@ -1318,7 +1346,6 @@ def main():
     # To force randomized/default init, use:
     #   QD_PHYTO_INIT_RANDOM=1  → randomize_state()
     # Otherwise falls back to reset_default_state() via that block when no files are present.
-    pass
 
     # Optional: load plankton bio/distribution on startup (controlled by QD_LOAD_PLANKTON=1)
     try:
@@ -1397,9 +1424,16 @@ def main():
                 if rst.get("vo") is not None: ocean.vo = rst["vo"]
                 if rst.get("eta") is not None: ocean.eta = rst["eta"]
                 if rst.get("Ts") is not None: ocean.Ts = rst["Ts"]
-            # Hydrology
+            # Hydrology / Cryo
             if rst.get("W_land") is not None: W_land = rst["W_land"]
             if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
+            # Persisted snow optical coverage for immediate visualization continuity
+            try:
+                C_snow_rst = rst.get("C_snow", None)
+                if C_snow_rst is not None:
+                    gcm.C_snow_map_last = C_snow_rst
+            except Exception:
+                pass
             # Load genes autosave JSON (if present) before LAI/species weights
             if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
                 try:
@@ -1469,6 +1503,13 @@ def main():
                     if rst.get("Ts") is not None: ocean.Ts = rst["Ts"]
                 if rst.get("W_land") is not None: W_land = rst["W_land"]
                 if rst.get("S_snow") is not None: S_snow = rst["S_snow"]
+                # Persisted snow optical coverage for immediate visualization continuity
+                try:
+                    C_snow_rst = rst.get("C_snow", None)
+                    if C_snow_rst is not None:
+                        gcm.C_snow_map_last = C_snow_rst
+                except Exception:
+                    pass
                 print(f"[Autosave] Loaded checkpoint from '{autosave_nc}'.")
                 # Optionally load standardized ocean.nc to override ocean fields
                 try:
@@ -1545,6 +1586,18 @@ def main():
     K_OROG = float(os.getenv("QD_OROG_K", "7e-4"))
     # Diagnostics toggle: per-star ISR components (disabled by default)
     PLOT_ISR = int(os.getenv("QD_PLOT_ISR", "0")) == 1
+
+    # --- P019: Lapse & geometry constraints (docs/18, projects/019) ---
+    LAPSE_ENABLE = int(os.getenv("QD_LAPSE_ENABLE", "1")) == 1
+    GAMMA_KPM = float(os.getenv("QD_LAPSE_K_KPM", "6.5"))     # K/km for air
+    GAMMA_S_KPM = float(os.getenv("QD_LAPSE_KS_KPM", os.getenv("QD_LAPSE_K_KPM", "6.5")))  # K/km for surface gate
+    LAND_ELEV_MAX_M = float(os.getenv("QD_LAND_ELEV_MAX_M", "10000"))
+    POLAR_ICE_THICK_MAX_M = float(os.getenv("QD_POLAR_ICE_THICK_MAX_M", "4500"))
+    POLAR_LAT_THRESH = float(os.getenv("QD_POLAR_LAT_THRESH", "60"))
+    RHO_SNOW = float(os.getenv("QD_RHO_SNOW", "300"))  # kg/m^3, geometric conversion for snow
+    # Glacier mask thresholds（陆地冰相掩膜阈值）
+    GLACIER_FRAC = float(os.getenv("QD_GLACIER_FRAC", "0.60"))     # C_snow ≥ 0.60 → 冰盖
+    GLACIER_SWE_MM = float(os.getenv("QD_GLACIER_SWE_MM", "50.0")) # 或 SWE ≥ 50 mm → 冰盖
     
     # Optional epoch override (only if no restart/autosave time was loaded)
     if t0_seconds == 0.0:
@@ -1721,10 +1774,34 @@ def main():
                         soil_cap = 50.0
                     # W_land 单位≈kg/m^2 ≡ mm；归一化后截断到 [0,1]
                     soil_idx = np.clip(W_land / max(1e-6, soil_cap), 0.0, 1.0)
+                    # 冰盖处植物无法生存：将冰盖处土壤指数置 0，抑制 LAI 增长
+                    try:
+                        if hasattr(gcm, "glacier_mask_last"):
+                            soil_idx = soil_idx * (~gcm.glacier_mask_last)
+                    except Exception:
+                        pass
                     eco.step_daily(soil_idx)
+                    # 保险起见，若生态内核没有处理，强制将冰盖处 LAI 置 0
+                    try:
+                        if getattr(eco, "pop", None) is not None and hasattr(eco.pop, "LAI") and hasattr(gcm, "glacier_mask_last"):
+                            mgl = gcm.glacier_mask_last
+                            eco.pop.LAI = np.where(mgl, 0.0, eco.pop.LAI)
+                    except Exception:
+                        pass
                     # Individual pool daily aggregation -> adjust species splits for sampled cells
                     if 'indiv' in locals() and indiv is not None:
                         try:
+                            # Exclude glacier pixels from individual sampling to save compute
+                            try:
+                                glacier_mask = getattr(gcm, "glacier_mask_last", None)
+                                if glacier_mask is not None:
+                                    active_mask = ((land_mask == 1) & (~glacier_mask))
+                                    if hasattr(indiv, "set_active_mask"):
+                                        indiv.set_active_mask(active_mask)
+                                    elif hasattr(indiv, "land_mask"):
+                                        indiv.land_mask = active_mask.astype(int)
+                            except Exception:
+                                pass
                             indiv.step_daily(eco, soil_idx, Ts_map=gcm.T_s, day_length_hours=24.0)
                         except Exception as _ied:
                             if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
@@ -1839,6 +1916,81 @@ def main():
         gcm.isr_A, gcm.isr_B = insA, insB
         gcm.isr = insA + insB
 
+        # --- P019: Lapse-adjusted temperatures and smooth phase split + provisional snowpack update ---
+        # Compute atmospheric temperature proxy (consistent with dynamics core simplification)
+        g_const = 9.81
+        T_a_proxy = 288.0 + (g_const / 1004.0) * gcm.h
+
+        # Geometry: bedrock elevation and snow geometric thickness (land only)
+        H_bedrock = elevation if (('elevation' in locals()) and (elevation is not None)) else np.zeros_like(gcm.T_s)
+        # SWE unit here is kg/m^2 ≡ mm of water; convert to geometric snow thickness by rho_snow
+        h_snow_geom = np.where(land_mask == 1, np.maximum(S_snow, 0.0) / max(RHO_SNOW, 1e-6), 0.0)
+        # Polar cap thickness limit
+        polar_mask = (np.abs(grid.lat_mesh) >= POLAR_LAT_THRESH)
+        h_ice_eff = np.where(polar_mask, np.minimum(h_snow_geom, POLAR_ICE_THICK_MAX_M), h_snow_geom)
+        # Effective elevation (cap to LAND_ELEV_MAX_M)
+        H_eff = np.minimum(H_bedrock + h_ice_eff, LAND_ELEV_MAX_M)
+
+        # Lapse-adjusted temps
+        if LAPSE_ENABLE:
+            T_hat_a = T_a_proxy - GAMMA_KPM * (H_eff / 1000.0)
+            T_hat_s = gcm.T_s - GAMMA_S_KPM * (H_eff / 1000.0)
+        else:
+            T_hat_a = T_a_proxy
+            T_hat_s = gcm.T_s
+
+        # Smooth phase split using T_hat_a (Sigmoid)
+        # Use hydrology params loaded earlier for thresholds/ΔT
+        try:
+            dT_half = float(getattr(hydro_params, "snow_t_band_K", 1.5))
+        except Exception:
+            dT_half = 1.5
+        P_rain_p019, P_snow_p019, f_snow_p019 = partition_precip_phase_smooth(
+            P_flux=gcm.isr*0.0 + (0.0 if 'precip' not in locals() else precip),  # safe shape; replaced below if precip exists
+            T_hat_a=T_hat_a,
+            T_thresh=hydro_params.snow_thresh_K,
+            dT_half_K=dT_half
+        )
+        # Replace with actual precip field (ensure arrays)
+        P_flux_arr = precip if not np.isscalar(precip) else np.full_like(gcm.T_s, float(precip))
+        P_rain_p019, P_snow_p019, f_snow_p019 = partition_precip_phase_smooth(
+            P_flux=P_flux_arr, T_hat_a=T_hat_a, T_thresh=hydro_params.snow_thresh_K, dT_half_K=dT_half
+        )
+
+        # Provisional snowpack update (do not commit S_snow yet; reuse later to keep single-step update)
+        if getattr(hydro_params, "swe_enable", True):
+            land = (land_mask == 1)
+            P_snow_land_p019 = P_snow_p019 * land
+            S_snow_next_p019, melt_flux_land_p019, C_snow_map, alpha_snow_map_p019 = snowpack_step(
+                S_snow=S_snow, P_snow_land=P_snow_land_p019, T_hat_a=T_hat_a, params=hydro_params, dt=dt
+            )
+            # --- Glacier mask（陆地冰相掩膜）---
+            glacier_mask = (land_mask == 1) & ((C_snow_map >= GLACIER_FRAC) | (S_snow_next_p019 >= GLACIER_SWE_MM))
+            # 雨落在冰盖上：按“沉积”处理，转入 SWE（冻结沉积），不进入地表桶
+            try:
+                P_rain_land_glacier = (P_rain_p019 * (land_mask == 1)) * glacier_mask
+                if np.any(P_rain_land_glacier):
+                    S_snow_next_p019 = S_snow_next_p019 + P_rain_land_glacier * dt
+            except Exception:
+                pass
+            # Expose for TrueColor & downstream modules
+            try:
+                gcm.C_snow_map_last = C_snow_map
+                gcm.glacier_mask_last = glacier_mask
+            except Exception:
+                pass
+        else:
+            C_snow_map = np.zeros_like(gcm.T_s, dtype=float)
+            # Expose for TrueColor even when SWE disabled (renders nothing by default)
+            try:
+                gcm.C_snow_map_last = C_snow_map
+                gcm.glacier_mask_last = (land_mask == 1) & (C_snow_map >= GLACIER_FRAC)
+            except Exception:
+                pass
+            alpha_snow_map_p019 = np.full_like(gcm.T_s, float(os.getenv("QD_SNOW_ALBEDO_FRESH", "0.70")), dtype=float)
+            S_snow_next_p019 = S_snow.copy()
+            melt_flux_land_p019 = np.zeros_like(gcm.T_s, dtype=float)
+
         # 2a) Eco individual pool subdaily step (vectorized) - accumulate per-individual energy/day
         if 'indiv' in locals() and indiv is not None:
             try:
@@ -1852,6 +2004,18 @@ def main():
                 else:
                     soil_cap_sub = 50.0
                 soil_idx_sub = np.clip(W_land / max(1e-6, soil_cap_sub), 0.0, 1.0)
+                # Exclude glacier pixels from individual sampling to save compute
+                try:
+                    glacier_mask = getattr(gcm, "glacier_mask_last", None)
+                    if glacier_mask is not None:
+                        active_mask = ((land_mask == 1) & (~glacier_mask))
+                        if hasattr(indiv, "set_active_mask"):
+                            indiv.set_active_mask(active_mask)
+                        elif hasattr(indiv, "land_mask"):
+                            # Some implementations store mask as int map
+                            indiv.land_mask = active_mask.astype(int)
+                except Exception:
+                    pass
                 indiv.try_substep(gcm.isr_A, gcm.isr_B, eco, soil_idx_sub, dt, day_in_seconds)
             except Exception as _ies:
                 if int(os.getenv("QD_ECO_DIAG", "1")) == 1 and i == 0:
@@ -1900,7 +2064,12 @@ def main():
                     W_LAI = 1.0
                 # Blend ecology alpha into land base albedo
                 land = (land_mask == 1)
-                m = land & np.isfinite(alpha_apply)
+                # 冰盖区域不混入生态反照率（保持雪/冰主导）
+                try:
+                    glacier_mask = getattr(gcm, "glacier_mask_last", np.zeros_like(land_mask, dtype=bool))
+                except Exception:
+                    glacier_mask = np.zeros_like(land_mask, dtype=bool)
+                m = land & (~glacier_mask) & np.isfinite(alpha_apply)
                 base_input[m] = (1.0 - W_LAI) * base_input[m] + W_LAI * alpha_apply[m]
                 # cache for viz if new map arrived
                 if alpha_map is not None:
@@ -1930,6 +2099,19 @@ def main():
             except Exception as _pc:
                 if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1 and i == 0:
                     print(f"[Phyto] coupling skipped: {_pc}")
+
+        # --- P019: Blend snow cover into land surface base albedo ---
+        try:
+            if getattr(hydro_params, "swe_enable", True):
+                land = (land_mask == 1)
+                # α_surface_eff = α_base·(1 − C_snow) + α_snow·C_snow
+                base_input[land] = np.clip(
+                    (1.0 - C_snow_map[land]) * base_input[land] + C_snow_map[land] * alpha_snow_map_p019[land],
+                    0.0, 1.0
+                )
+        except Exception as _sb:
+            if i == 0:
+                print(f"[P019] snow-albedo blend skipped: {_sb}")
 
         # 2c) Final dynamic albedo (surface base + cloud + ice)
         albedo = calculate_dynamic_albedo(
@@ -2091,25 +2273,48 @@ def main():
             if np.isscalar(P_flux):
                 P_flux = np.full_like(gcm.T_s, float(P_flux))
 
-            # Phase partition (rain/snow) by surface temperature
-            P_rain, P_snow = partition_precip_phase(P_flux, gcm.T_s, T_thresh=hydro_params.snow_thresh_K)
-
+            # Phase partition & snowpack update (P019) — reuse provisional values computed before albedo
             land = (land_mask == 1)
-            # Land components
-            P_rain_land = P_rain * land
-            P_snow_land = P_snow * land
-            E_land = E_flux * land
+            if 'P_rain_p019' in locals():
+                P_rain = P_rain_p019
+                P_snow = P_snow_p019
+                P_rain_land = P_rain * land
+                P_snow_land = P_snow * land
+                E_land = E_flux * land
+                # Commit the provisional snowpack update
+                S_snow = S_snow_next_p019
+                melt_flux_land = melt_flux_land_p019
+            else:
+                # Fallback legacy (no lapse/sigmoid), threshold on T_s
+                P_rain, P_snow = partition_precip_phase(P_flux, gcm.T_s, T_thresh=hydro_params.snow_thresh_K)
+                P_rain_land = P_rain * land
+                P_snow_land = P_snow * land
+                E_land = E_flux * land
+                S_snow, melt_flux_land = snow_step(S_snow, P_snow_land, gcm.T_s, hydro_params, dt)
 
-            # Update land snow reservoir and compute melt flux (kg m^-2 s^-1)
-            S_snow, melt_flux_land = snow_step(S_snow, P_snow_land, gcm.T_s, hydro_params, dt)
+            # Land bucket update: 冰盖处不入桶；冰下管网仅接收融水
+            try:
+                glacier_mask = getattr(gcm, "glacier_mask_last", np.zeros_like(land_mask, dtype=bool))
+            except Exception:
+                glacier_mask = np.zeros_like(land_mask, dtype=bool)
+            non_glacier = (land_mask == 1) & (~glacier_mask)
 
-            # Land bucket update: inputs = rain + snowmelt; evaporation removes; runoff returned to ocean
-            P_in_land = P_rain_land + melt_flux_land
-            W_land, R_flux_land = update_land_bucket(W_land, P_in_land, E_land, hydro_params, dt)
+            # 非冰盖：入桶（雨 + 融水），蒸发按原值；冰盖：不入桶（雨已在上文沉积进 SWE）
+            P_in_land_non_glacier = (P_rain_land + melt_flux_land) * non_glacier
+            E_land_non_glacier = E_land * non_glacier
+
+            W_land, R_flux_land_bucket = update_land_bucket(W_land, P_in_land_non_glacier, E_land_non_glacier, hydro_params, dt)
+
+            # 冰盖融水（kg m^-2 s^-1）直接作为“下游流量源”进入路由（不通过桶）
+            R_flux_glacier_melt = melt_flux_land * glacier_mask
+
+            # 合成对路由的总陆面出流
+            R_flux_land_total = R_flux_land_bucket + R_flux_glacier_melt
+
             # P014: route runoff along offline network (if enabled)
             if 'routing' in locals() and routing is not None:
                 try:
-                    routing.step(R_land_flux=R_flux_land, dt_seconds=dt, precip_flux=P_flux, evap_flux=E_flux)
+                    routing.step(R_land_flux=R_flux_land_total, dt_seconds=dt, precip_flux=P_flux, evap_flux=E_flux)
                 except Exception as _re:
                     if i == 0:
                         print(f"[HydroRouting] step skipped due to error: {_re}")
@@ -2136,7 +2341,7 @@ def main():
                     S_snow=S_snow,
                     E_flux=E_flux,
                     P_flux=P_flux,        # use diagnosed precip (hybrid), not P_cond
-                    R_flux=R_flux_land,   # runoff only from land
+                    R_flux=R_flux_land_total,   # runoff only from land (bucket + glacier melt)
                     dt_since_prev=dt_since_prev,
                     prev_total=_hydro_prev_total
                 )
@@ -2266,7 +2471,10 @@ def main():
         except Exception:
             t_sec_final = 0.0
         try:
-            save_restart(restart_out, grid, gcm, ocean, land_mask, W_land=W_land, S_snow=S_snow, t_seconds=t_sec_final)
+            save_restart(
+                restart_out, grid, gcm, ocean, land_mask,
+                W_land=W_land, S_snow=S_snow, C_snow=getattr(gcm, "C_snow_map_last", None), t_seconds=t_sec_final
+            )
             print(f"[Restart] Saved final state to '{restart_out}'.")
             # Also export ocean.nc alongside restart_out (standardized ocean state)
             try:

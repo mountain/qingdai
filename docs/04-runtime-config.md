@@ -158,6 +158,9 @@
   - QD_SNOW_DDF_MM_PER_K_DAY（默认 3.0）度日融雪系数（mm/K/day）
   - QD_SNOW_MELT_TREF（默认 273.15 K）融雪起始温度
   - QD_SNOW_FASTFLOW_FRAC（默认 0.0）融雪快流比例（0..1）
+  - QD_GLACIER_FRAC（默认 0.60）冰盖判定的雪覆盖阈值 C_snow（0..1）  
+  - QD_GLACIER_SWE_MM（默认 50.0）冰盖判定的 SWE 阈值（mm；1 mm ≡ 1 kg·m⁻²）  
+    说明：冰盖像元上“雨仅沉积入 SWE，融水直达路由（冰下管网）”，不进入陆地桶；生态在冰盖处掩膜（soil_idx=0，LAI=0，个体采样禁用）
 - QD_WATER_DIAG（默认 1）水量闭合诊断打印
 
 ---
@@ -193,7 +196,10 @@ Shapiro 与谱带阻：
 - QD_TRUECOLOR_ICE_FRAC（默认 0.15）TrueColor 冰渲染阈值  
 - QD_TRUECOLOR_CLOUD_ALPHA（默认 0.60）云不透明度  
 - QD_TRUECOLOR_CLOUD_WHITE（默认 0.95）云白度  
-- QD_TRUECOLOR_SNOW_BY_TS（默认 0）按温度渲染陆地积雪
+- QD_TRUECOLOR_SNOW_BY_TS（默认 0）按温度渲染陆地积雪  
+- QD_TRUECOLOR_SNOW_BY_SWE（默认 1）按雪被 SWE/C_snow 渲染陆地积雪（与 P019 一致）  
+- QD_SNOW_COVER_FRAC（默认 0.20）C_snow 的可视化覆盖阈值（0..1）  
+- QD_SNOW_VIS_ALPHA（默认 0.60）雪覆盖在 TrueColor 中的混合强度
 
 能量/湿度/水文/海洋诊断：
 - QD_ENERGY_DIAG、QD_HUMIDITY_DIAG、QD_WATER_DIAG、QD_OCEAN_ENERGY_DIAG 见各模块
