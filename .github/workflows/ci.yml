@@ -50,20 +50,20 @@ jobs:
       - name: Lint (ruff)
         run: |
           ruff version
-          # Only lint OO skeleton and tests for Phase 0
-          ruff check --output-format=github pygcm/world tests
+          # Lint OO skeleton, numerics (DBA), and tests
+          ruff check --output-format=github pygcm/world pygcm/numerics tests
 
       - name: Format check (black)
         run: |
           black --version
-          # Only check OO skeleton and tests for Phase 0
-          black --check pygcm/world tests
+          # Format check for OO skeleton, numerics (DBA), and tests
+          black --check pygcm/world pygcm/numerics tests
 
       - name: Type check (mypy)
         run: |
           mypy --version
-          # Only type-check OO skeleton and tests for Phase 0
-          mypy pygcm/world tests
+          # Type-check OO skeleton, numerics (DBA), and tests
+          mypy pygcm/world pygcm/numerics tests
 
       - name: Run tests
         run: |

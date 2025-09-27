@@ -12,6 +12,8 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pygcm.numerics.double_buffer import DoubleBufferingArray as _DBA
+
 # Typing-only import to keep mypy happy without requiring runtime import
 if TYPE_CHECKING:  # pragma: no cover
     from pygcm.grid import SphericalGrid as _SphericalGrid
@@ -110,10 +112,23 @@ class ParamsRegistry:
 
 
 @dataclass
+class MiniState:
+    """Minimal DBA-backed state (Phase 0 demo)."""
+
+    tick: _DBA
+
+
+@dataclass
 class WorldState:
     """Minimal world state for Phase 0. Extended in later phases."""
 
     t_seconds: float = 0.0
+    mini: MiniState | None = None
+
+    def swap_all(self) -> None:
+        """Swap all DBA buffers contained in this state (minimal Phase 0 demo)."""
+        if self.mini is not None and isinstance(self.mini.tick, _DBA):
+            self.mini.tick.swap()
 
 
 # ----------------
@@ -150,6 +165,11 @@ class QingdaiWorld:
         # Double buffer placeholders (Phase 0: no external use)
         self.current_state = state or WorldState(t_seconds=0.0)
         self.next_state = WorldState(t_seconds=0.0)
+        # Ensure DBA mini state present for both buffers (M2 minimal integration)
+        if getattr(self.current_state, "mini", None) is None:
+            self.current_state.mini = MiniState(tick=_DBA((1,), dtype=float, initial_value=0.0))
+        if getattr(self.next_state, "mini", None) is None:
+            self.next_state.mini = MiniState(tick=_DBA((1,), dtype=float, initial_value=0.0))
 
         # DI slots (kept for future phases; unused in Phase 0)
         self.atmos = atmos
