@@ -1,0 +1,70 @@
+Name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+        python-version: [ '3.11', '3.12', '3.13' ]
+
+    env:
+      # Fallbacks; tests also set these via conftest.py
+      MPLBACKEND: Agg
+      QD_AUTOSAVE_ENABLE: "0"
+      QD_AUTOSAVE_LOAD: "0"
+      QD_USE_OCEAN: "0"
+      QD_ECO_ENABLE: "0"
+      QD_PHYTO_ENABLE: "0"
+      QD_HYDRO_ENABLE: "0"
+      QD_HYDRO_NETCDF: ""
+      QD_PLOT_EVERY_DAYS: "1000000"
+      QD_USE_JAX: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Install tooling explicitly to avoid installing the package (pyproject may require 3.13+)
+          pip install pytest black ruff mypy
+
+      - name: Lint (ruff)
+        run: |
+          ruff version
+          # Only lint OO skeleton and tests for Phase 0
+          ruff check --output-format=github pygcm/world tests
+
+      - name: Format check (black)
+        run: |
+          black --version
+          # Only check OO skeleton and tests for Phase 0
+          black --check pygcm/world tests
+
+      - name: Type check (mypy)
+        run: |
+          mypy --version
+          # Only type-check OO skeleton and tests for Phase 0
+          mypy pygcm/world tests
+
+      - name: Run tests
+        run: |
+          pytest -q

@@ -36,6 +36,11 @@ from pygcm.routing import RiverRouting
 from pygcm import energy as energy
 from pygcm.ocean import WindDrivenSlabOcean
 from pygcm.jax_compat import is_enabled as JAX_IS_ENABLED
+# P020 Phase 0: OO façade (optional)
+try:
+    from pygcm.world import QingdaiWorld  # Phase 0 skeleton
+except Exception:
+    QingdaiWorld = None
 # Ecology (P015 M1) adapter + Phyto (P017)
 try:
     from pygcm.ecology import EcologyAdapter, PhytoManager
@@ -1162,6 +1167,28 @@ def main():
         print(f"[JAX] Acceleration enabled: {JAX_IS_ENABLED()} (toggle via QD_USE_JAX=1; platform via QD_JAX_PLATFORM=cpu|gpu|tpu)")
     except Exception:
         pass
+
+    # P020 Phase 0 switch (non-intrusive): when QD_USE_OO=1, instantiate façade and run stub.
+    # Legacy path continues unless QD_USE_OO_STRICT=1.
+    try:
+        USE_OO = int(os.getenv("QD_USE_OO", "0")) == 1
+        OO_STRICT = int(os.getenv("QD_USE_OO_STRICT", "0")) == 1
+    except Exception:
+        USE_OO, OO_STRICT = False, False
+    if USE_OO:
+        if QingdaiWorld is not None:
+            try:
+                world = QingdaiWorld.create_default()
+                print("[P020] QD_USE_OO=1 → QingdaiWorld façade active (Phase 0).")
+                # Phase 0 stub (does not alter legacy behavior)
+                world.run()
+            except Exception as _wo:
+                print(f"[P020] world façade run stub raised: {_wo}")
+            if OO_STRICT:
+                print("[P020] QD_USE_OO_STRICT=1 → exiting legacy engine after façade run.")
+                return
+        else:
+            print("[P020] QD_USE_OO=1 but pygcm.world is unavailable; continuing with legacy engine.")
 
     # 1. Initialization
     print("Creating grid...")

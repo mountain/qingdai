@@ -127,3 +127,89 @@
 ## 📜 许可证
 
 本项目采用 [MIT 许可证](./LICENSE)。
+
+---
+
+## 👩‍💻 开发者指引（Phase 0）
+
+本节面向开发者，介绍本地开发环境、质量检查与测试流程，以及 P020 Phase 0 的 OO 骨架开关。
+
+### 1) 环境与安装
+
+- 推荐 Python 3.11+（CI 同时在 3.11/3.12/3.13 上验证）
+- 克隆代码后，进入仓库根目录，安装开发依赖：
+  - 使用 pip：
+    ```bash
+    python3 -m venv .venv && source .venv/bin/activate
+    python3 -m pip install --upgrade pip
+    pip install -e '.[dev]'
+    ```
+  - 或使用 uv：
+    ```bash
+    uv venv && source .venv/bin/activate
+    uv pip install -e '.[dev]'
+    ```
+
+说明：
+- 项目包本体并非必须安装即可运行工具链（black/ruff/mypy/pytest），但安装 `.[dev]` 可一次性获得这些工具。
+- 若遇到 Python 版本约束，可直接使用工具链命令（无需安装包本体）。
+
+### 2) 质量检查与测试（本地）
+
+当前 Phase 0 仅对 `pygcm/world` 与 `tests` 目录执行格式/静态/类型检查（后续阶段将逐步扩大覆盖面）：
+
+```bash
+# 代码风格（不修改代码）
+ruff check pygcm/world tests
+
+# 格式化（仅检查；如需自动修复可去掉 --check）
+black --check pygcm/world tests
+
+# 类型检查
+mypy pygcm/world tests
+
+# 单元测试
+pytest -q
+```
+
+提示：
+- `tests/conftest.py` 会将默认网格缩小（10×20）、禁用 autosave 与重型子系统（海洋/生态/路由/海色），并设置 `MPLBACKEND=Agg`，确保测试快速稳定。
+- 若需要在单测中启用相关子系统，可在测试用例中使用 `monkeypatch` 单独开启。
+
+### 3) CI
+
+仓库已配置 GitHub Actions（`.github/workflows/ci.yml`）：
+- 平台矩阵：Ubuntu/macOS × Python 3.11/3.12/3.13
+- 步骤顺序：`ruff check` → `black --check` → `mypy` → `pytest`
+- 同样仅针对 `pygcm/world` 与 `tests` 范围做静态与类型检查
+
+### 4) P020 Phase 0：OO 骨架与开关
+
+Phase 0 提供最小 OO 骨架（`pygcm/world`），默认保持 legacy 路径不变：
+- 激活 façade（仍运行 legacy 引擎）：
+  ```bash
+  export QD_USE_OO=1
+  python3 -m scripts.run_simulation
+  ```
+- 仅运行 façade 桩函数（跳过 legacy）：
+  ```bash
+  export QD_USE_OO=1
+  export QD_USE_OO_STRICT=1
+  python3 -m scripts.run_simulation
+  ```
+
+后续 Phase 1–5 将逐步将模块迁移进 OO 世界对象（参数对象化、纯函数化 forcing/physics、JAX 优先、生态/水文等子系统契约化）。
+
+### 5) 测试策略与范围
+
+- Phase 0：已提供基础用例与 `scripts/test_orbital_module.py` 的 pytest 迁移版
+  - `tests/test_phase0_basics.py`
+  - `tests/test_orbital_module.py`
+- 生态 autosave 的测试迁移将在 Phase 1 引入“契约级测试”（不锁死文件格式细节，以便重构）
+- 若需添加更多测试，建议优先选择“物理/数学不变量、契约接口”类型用例，避免对实现细节形成过早约束
+
+### 6) 贡献与协作
+
+- 代码提交前建议先运行本地工具链（ruff/black/mypy/pytest）
+- 若提交涉及 CI/工具配置（pyproject/CI/workflows），请说明变更范围与动机
+- 参考协作流程：参见 [AGENTS.md](./AGENTS.md)
