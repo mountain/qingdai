@@ -1,7 +1,8 @@
-# 项目 P020（修订版 v1.1）：架构重构（面向对象 + 可测试 + 渐进迁移）
+# 项目 P020（修订版 v1.2）：架构重构（面向对象 + 可测试 + 渐进迁移）
 
 状态：提案→可落地设计（2025‑09‑27）  
 作者：Cline（AI 软件工程师）  
+修订：v1.2 合入评审建议（Pydantic 校验 / 依赖注入 / Façade API 合约 / JAX‑First 设计）  
 关联文档与代码：
 - docs/12-code-architecture-and-apis.md（现有架构与模块职责）
 - scripts/run_simulation.py（现行主循环）
@@ -9,10 +10,10 @@
 - projects/016-jax-acceleration.md（JAX 兼容与加速路径）
 - 所有 docs/04（运行时参数目录与环境变量），docs/06/07/08/09/10/11/14/15/16/18（物理与生态设计）
 
-本文件目标：将“面向对象重构”的愿景落为可执行蓝图，明确对象边界、API 合约、迁移阶段、测试与验收标准、兼容策略与性能预算，确保以最小风险渐进完成重构。
+本文件目标：将“面向对象重构”的愿景落为可执行蓝图，明确对象边界、API 合约、迁移阶段、测试与验收标准、兼容策略与性能预算，确保以最小风险渐进完成重构。v1.2 在 v1.1 的基础上，落实了“以代码强制的边界约束”“依赖注入提升可测性”“Façade 即 API 合约”“JAX‑First 纯函数化”四项增强。
 
 
-## 0. 设计原则（与现有仓库一致）
+## 0. 设计原则（与现有仓库一致，v1.2 强化）
 
 - 渐进迁移：禁止“大爆炸”式重写。新增 OO 层首先作为 façade 包裹现有实现，逐步内收。
 - 单一职责：对象封装“状态 + 行为”；物理公式与数值算子尽量做成纯函数模块（stateless）。
@@ -21,65 +22,137 @@
 - 守恒优先：任何阶段的修改都不得破坏 docs/06/08/09 规定的能量/水量闭合标准。
 - 性能预算：重构后端到端步时开销不增加（±5% 范围内）；新增层次不可引入不必要复制。
 
+v1.2 追加：
+- JAX‑First：核心数值/物理算子按“纯函数 + 无副作用 + 定形数组”组织，优先满足 `@jit` 编译、`vmap` 向量化的要求（详见 §10、§2“纯函数模块”）。
+- DI（依赖注入）优先：`QingdaiWorld` 通过构造函数接收子系统实例，测试可注入 mock/stub；提供 `create_default()` 工厂方法封装默认装配（详见 §2、§4）。
+- 状态“伪不可变”策略：推荐 `step()` 返回新的 `WorldState`（值语义），主循环赋值替换，以杜绝隐式共享副作用；性能敏感段可局部采用 in‑place 写入（详见 §1）。
+- Façade = API 合约：临时 façade 类的公开方法签名应与目标类完全一致，保障“热切换无代码改动”（详见 §3.5）。
 
-## 1. 概念边界（Configuration / Parameter / State）
 
-与 docs/12 对齐，但在工程层面明确“生命周期与存储”：
+## 1. 概念边界（Configuration / Parameter / State）与“以代码强制”的实现
+
+与 docs/12 对齐，但在工程层面明确“生命周期与存储”与“代码层约束”：
 
 - Configuration（配置，运行前确定，运行期不可变）
   - 例：网格分辨率（n_lat, n_lon）、dt、数值方案/开关（QD_FILTER_TYPE, QD_USE_OCEAN）。
-  - 表达：不可变 dataclass（`SimConfig`）；序列化到元数据（restart/header）。
-
+  - 表达：不可变模型 `SimConfig`。
+  - v1.2：建议采用 **Pydantic** `BaseModel`（或 v2 `BaseModel`/`pydantic-settings`）代替纯 dataclass，用于加载时的**运行时类型检查与值验证**（如 `dt_seconds > 0`、`filter_type ∈ {"combo","hyper4","shapiro","spectral"}` 等）。
+    ```python
+    # 示例（文档内伪代码）
+    from pydantic import BaseModel, field_validator
+    class SimConfig(BaseModel, frozen=True):
+        n_lat: int
+        n_lon: int
+        dt_seconds: float
+        filter_type: str
+        use_ocean: bool = True
+        @field_validator("dt_seconds")
+        @classmethod
+        def _dt_pos(cls, v): 
+            assert v > 0, "dt_seconds must be > 0"
+            return v
+        @field_validator("filter_type")
+        @classmethod
+        def _ft_ok(cls, v):
+            assert v in {"combo","hyper4","shapiro","spectral"}
+            return v
+    ```
 - Parameter（参数，定义规律，单次实验通常恒定，可由实验更改）
   - 例：物理常数、温室参数、Bowen 比、生态基因库、光谱带定义。
-  - 表达：不可变/可版本化 dataclass（`PhysicsParams`, `EcologyParams`, `SpectralBands` 等）。
-
+  - 表达：不可变/可版本化模型 `PhysicsParams`, `EcologyParams`, `SpectralBands`（同样推荐采用 Pydantic，用于枚举/范围验证）。
 - State（状态，时间快照）
   - 例：u, v, h, Ts, Ta, q, cloud, SST, uo, vo, η, h_ice, W_land, SWE, routing buffers, LAI/生态状态等。
-  - 表达：可变 dataclass（`WorldState` 拆分子状态）；支持全量/分组持久化；含 schema_version。
+  - 表达：可变容器 `WorldState` 拆分子状态；支持全量/分组持久化；含 schema_version。
+  - v1.2 “伪不可变”策略：**值语义演化**。`QingdaiWorld.step()` 的推荐接口为：
+    ```python
+    def step(self) -> "WorldState":
+        new_state = self._compute_next_state(self.state)
+        self.state = new_state
+        return new_state
+    ```
+    这样杜绝了时间步内的跨子系统隐式副作用；对性能敏感段，允许内部采用 in‑place 写数组，但必须保证对外暴露的 `WorldState` 替换为新的逻辑对象（copy‑on‑write 或 builder 模式）。该策略简化调试与回放，便于引入“状态快照对比”的测试工具。
 
 
-## 2. 目标对象模型（类与模块）
+## 1A. 状态管理与演化：双缓冲（Double Buffering）
+
+为在保证“时间步不可变/原子更新”的同时兼顾性能，建议在 QingdaiWorld 内采用“双缓冲”机制管理 WorldState：
+
+- 初始化：在启动时创建两个 WorldState 实例，分别记为 current_state 与 next_state。
+- 单步演化（第 n 步）：
+  - 所有子系统读取 current_state（视为只读），并将结果写入 next_state（构建“下一状态”）。
+  - 子系统方法推荐形态：`subsystem.step(read_state, write_state, ...)`，或在对象内部通过 world.current_state/world.next_state 访问。
+- 缓冲交换（Buffer Swap）：
+  - 步末仅交换引用而非复制数据：`current_state, next_state = next_state, current_state`。
+  - 通过该交换，避免了每步全量分配/复制，显著降低内存与 GC 压力。
+
+此策略是“伪不可变”的工程化实现：在同一时间步内严格分离“读缓冲（current）”与“写缓冲（next）”，杜绝跨模块交错写入导致的脏读；同时复用内存，满足高性能需求。
+
+推荐最小实现示意：
+```python
+class QingdaiWorld:
+    def __init__(...):
+        self.current_state = self._alloc_initial_state()
+        self.next_state = self._alloc_initial_state()
+
+    def step(self):
+        # 读取 self.current_state，写入 self.next_state
+        self.forcing.update(self.current_state, self.next_state)
+        self.atmos.time_step(self.current_state, self.next_state)
+        if self.config.use_ocean:
+            self.ocean.step(self.current_state, self.next_state)
+        self.hydro.step(self.current_state, self.next_state)
+        if self.config.use_routing:
+            self.route.step(self.current_state, self.next_state)
+        if self.config.use_ecology:
+            self.eco.step_subdaily(self.current_state, self.next_state)
+            if self._hits_day_boundary():
+                self.eco.step_daily(self.current_state, self.next_state)
+        # 步末：时间推进+缓冲交换
+        self.next_state.t_seconds = self.current_state.t_seconds + self.config.dt_seconds
+        self.current_state, self.next_state = self.next_state, self.current_state
+        return self.current_state
+```
+
+与“返回新状态”的纯函数式方案相比，双缓冲可避免每步大规模数组重新分配，更适合包含海量场变量的 GCM；在接口层面仍保持值语义（对外暴露“新状态”），并可与 JAX‑First 的纯函数内核配合（内核函数对输入/输出数组显式区分，满足 @jit 的副作用约束）。
+
+## 2. 目标对象模型（类与模块）与 DI/JAX‑First
 
 顶层对象（面板）：
 - QingdaiWorld（有状态对象）
-  - config: SimConfig
-  - params: ParamsRegistry（聚合 PhysicsParams/EcologyParams/SpectralBands 等）
+  - config: SimConfig（Pydantic）
+  - params: ParamsRegistry（聚合 PhysicsParams/EcologyParams/SpectralBands）
   - grid: Grid
   - subsystems: Atmosphere, Ocean, Surface, Hydrology, Routing, Ecology, Forcing（见下）
   - state: WorldState（聚合各子状态）
+  - DI（依赖注入）：构造函数接收“可选子系统实例”；未传入时由 `create_default()` 工厂创建默认实例（便于测试注入 mock）。
+    ```python
+    class QingdaiWorld:
+        def __init__(self, config, params, grid,
+                     atmos=None, ocean=None, surface=None, hydrology=None, routing=None, ecology=None, forcing=None,
+                     state=None):
+            self.config, self.params, self.grid = config, params, grid
+            self.atmos = atmos or Atmosphere.default(config, params, grid)
+            self.ocean = ocean or Ocean.default(config, params, grid)
+            # ...
+            self.state = state or self._alloc_initial_state()
+
+        @classmethod
+        def create_default(cls, config=None, params=None, grid=None) -> "QingdaiWorld":
+            # 统一默认装配逻辑（可读 env，构造 grid/params 子对象）
+            ...
+    ```
   - methods:
-    - step(): 推进一个物理步，按统一时序协调子系统
-    - run(n_steps|duration): 运行循环
-    - save_state(path): 持久化（NetCDF/NPZ）
-    - load_state(path): 恢复（包含 schema 迁移）
-    - diagnostics(): 收集 EnergyDiag/HumidityDiag/WaterDiag/OceanDiag/EcologyDiag
-    - plotters(): 调用 plotting 模块输出图像
+    - step() -> WorldState：推进一个物理步（值语义，返回新状态）
+    - run(n_steps|duration)
+    - save_state(path) / load_state(path)
+    - diagnostics() / plotters()
 
 子系统（有状态对象）：
-- Atmosphere
-  - state: u, v, h, Ta（或 h 代理 Ta）、cloud, q, 辅助缓冲等
-  - apply_forcing(), time_step(), apply_diffusion(), diagnostics()
-- Ocean
-  - state: uo, vo, η, SST
-  - apply_wind_stress(), step(), advect_tracers(), polar_fix(), diagnostics()
-- Surface
-  - state: Ts, h_ice（厚度/冰盖）、C_s_map、α_base 等衍生图
-  - surface_energy_balance(), seaice_thermo(), albedo_fusion() （与 Physics 组合器协作）
-- Hydrology（P009 + P019 融合的陆面/雪被/桶）
-  - state: W_land, SWE_mm, C_snow, snow_age（可选）
-  - partition_precip_phase_smooth(), snowpack_step(), land_bucket_step(), diagnostics()
-- Routing（P014）
-  - state: internal buffers, flow_accum_kgps, lake_volume ...
-  - step(runoff_flux, precip_flux?, evap_flux?), diagnostics()
-- Ecology
-  - state: 生态个体/群落/LAI/seed banks/缓存；海色 phyto（可选分为 MarineEcology）
-  - step_subdaily(), step_daily(), aggregate_surface_albedo_bands(), diagnostics()
-- Forcing（无状态组合器 + 适配）
-  - methods: orbital geometry, insolation(I), toa→surface spectral modulation
-  - 仅依赖 time, params, grid
+- Atmosphere / Ocean / Surface / Hydrology / Routing / Ecology / Forcing
+  - 均提供 `.default(config, params, grid)` 以支撑工厂式装配；构造函数保持最小依赖并可被测试替换。
+  - **JAX‑First**：数值核与物理公式置于纯函数模块（见下），对象方法完成组织/写回，便于 `@jit` 生效与单元测试可控。
 
-纯函数模块（stateless）：
+纯函数模块（stateless，JAX 友好）：
 - physics（docs/06 组合器）：shortwave, longwave, boundary_layer_fluxes, calculate_dynamic_albedo 等
 - numerics（docs/10 算子）：laplacian_sphere, hyperdiffusion, shapiro, spectral_filters
 - humidity（docs/08 核心算子）：q_sat, evaporation_flux, condensation
@@ -88,9 +161,7 @@
 - ecology_core（docs/13/14/15/16 带/吸收/聚合）  
 - jax_compat（与 projects/016 一致）：xp, map_coordinates 替换件
 
-绘图与 I/O（stateless）：
-- plotting：统一状态 → 面板/TrueColor/OceanColor
-- io_netcdf / io_npz：读写、schema、版本迁移工具
+（其余对象职责与 v1.1 一致，略）
 
 
 ## 3. 目录与文件布局（不破坏现有，新增 façade 层）
@@ -101,8 +172,8 @@ pygcm/
   world/
     __init__.py
     world.py           # QingdaiWorld（主编排）
-    config.py          # SimConfig 及解析环境变量的加载器
-    params.py          # ParamsRegistry + 各 Params dataclass
+    config.py          # SimConfig (Pydantic) + env/文件加载器
+    params.py          # ParamsRegistry + 各 Params (Pydantic)
     state.py           # WorldState + 子状态定义、schema_version
     forcing_facade.py  # Forcing façade（组合 orbital/physics/spectral）
     adapters.py        # 旧脚本/模块的适配层（渐进迁移）
@@ -121,107 +192,50 @@ pygcm/
 scripts/run_simulation.py  # 外观不变，逐步调用 world.QingdaiWorld
 ```
 
-说明：第一阶段，只“新增 world.FAÇADE + dataclass”；子系统先以“代理到现有模块函数/类”的方式实现，确保 0 风险接入。
+### 3.5 Façade = API 合约（v1.2 新增强制约束）
+
+- 临时 façade（如 `AtmosphereFacade`）的**公开方法签名**（方法名、参数列表、返回类型）**必须与最终 `Atmosphere` 类完全一致**。
+- 目的：确保后续从 façade 切换到真实实现时，`QingdaiWorld` 零改动；façade 不仅是临时代理，更是“提前冻结的 API 合约”。
+- 审核机制：对 façade 与目标类的签名进行单元测试级反射比对（如 `inspect.signature`）。
 
 
-## 4. API 合约（签名草案）
+## 4. API 合约（签名草案，含 DI 与工厂）
 
-关键 dataclass（示意）
+关键模型（以 Pydantic 表达；文档示意）
 ```python
-# pygcm/world/config.py
-from dataclasses import dataclass
-@dataclass(frozen=True)
-class SimConfig:
-    n_lat: int
-    n_lon: int
-    dt_seconds: float
-    plot_every_days: float
-    # feature flags
-    use_ocean: bool
-    use_seaice: bool
-    use_routing: bool
-    use_ecology: bool
-    # numerics
-    filter_type: str  # 'combo'|'hyper4'|'shapiro'|'spectral'
-    # ...（从环境变量解析填充）
-
-# pygcm/world/params.py
-@dataclass(frozen=True)
-class PhysicsParams: ...
-@dataclass(frozen=True)
-class SpectralBands: ...
-@dataclass(frozen=True)
-class EcologyParams: ...
-@dataclass(frozen=True)
-class ParamsRegistry:
+from pydantic import BaseModel, field_validator
+class SimConfig(BaseModel, frozen=True): ...
+class PhysicsParams(BaseModel, frozen=True): ...
+class SpectralBands(BaseModel, frozen=True): ...
+class EcologyParams(BaseModel, frozen=True): ...
+class ParamsRegistry(BaseModel, frozen=True):
     physics: PhysicsParams
     bands: SpectralBands
     ecology: EcologyParams
 ```
 
-状态容器（示意）
+状态容器（值语义，伪不可变策略）
 ```python
-# pygcm/world/state.py
 @dataclass
 class AtmosState: u: np.ndarray; v: np.ndarray; h: np.ndarray; Ta: np.ndarray; q: np.ndarray; cloud: np.ndarray
+# ... 其它子状态同 v1.1
 @dataclass
-class OceanState: uo: np.ndarray; vo: np.ndarray; eta: np.ndarray; sst: np.ndarray
-@dataclass
-class SurfaceState: Ts: np.ndarray; h_ice: np.ndarray; alpha_base: np.ndarray
-@dataclass
-class HydroState: W_land: np.ndarray; SWE_mm: np.ndarray; C_snow: np.ndarray
-@dataclass
-class RoutingState: flow_accum_kgps: np.ndarray; lake_volume_kg: np.ndarray; buffers: dict
-@dataclass
-class EcologyState: ...  # 见 docs/15/18/16
-@dataclass
-class WorldState:
-    atmos: AtmosState
-    ocean: OceanState
-    surface: SurfaceState
-    hydro: HydroState
-    routing: RoutingState
-    ecology: EcologyState
-    t_seconds: float
-    schema_version: int = 1
+class WorldState: ...
 ```
 
-世界对象（示意）
+世界对象（DI + 工厂 + 值语义）
 ```python
 class QingdaiWorld:
-    def __init__(self, config: SimConfig, params: ParamsRegistry, grid: Grid, state: Optional[WorldState]=None): ...
-    def step(self) -> None: ...
+    def __init__(self, config: SimConfig, params: ParamsRegistry, grid: Grid,
+                 atmos: Optional[Atmosphere]=None, ocean: Optional[Ocean]=None, ...,
+                 state: Optional[WorldState]=None): ...
+    @classmethod
+    def create_default(cls, config: Optional[SimConfig]=None, params: Optional[ParamsRegistry]=None, grid: Optional[Grid]=None) -> "QingdaiWorld": ...
+    def step(self) -> WorldState: ...
     def run(self, n_steps: Optional[int]=None, duration_days: Optional[float]=None) -> None: ...
-    def save_state(self, path: str) -> None: ...
-    def load_state(self, path: str) -> None: ...
-    def diagnostics(self) -> dict: ...
 ```
 
-子系统（示意接口）
-```python
-class Atmosphere:
-    def time_step(self, world: "QingdaiWorld") -> None: ...
-class Ocean:
-    def step(self, world: "QingdaiWorld") -> None: ...
-class Hydrology:
-    def step(self, world: "QingdaiWorld") -> None: ...
-class Routing:
-    def step(self, world: "QingdaiWorld") -> None: ...
-class Ecology:
-    def step_subdaily(self, world: "QingdaiWorld") -> None: ...
-    def step_daily(self, world: "QingdaiWorld") -> None: ...
-```
-
-时序（统一顺序，兼容 docs/12）
-1) Forcing/光谱/反照率预处理（必要的组合器，不改变状态）  
-2) Atmosphere.time_step（含 P010 反噪）  
-3) Humidity/E/LH/P_cond/LH_release 步（可以由 Atmosphere 内部调用）  
-4) Surface.energy（shortwave/longwave/SH/LH/seaice）  
-5) Ocean.step（风应力/平流/Q_net 注入/极点一致化）  
-6) Hydrology.step（相态/雪/桶/径流）  
-7) Routing.step（到水文步长时执行）  
-8) Ecology（subdaily/daily）  
-9) Diagnostics/Plotting（按频率）  
+时序（统一顺序，兼容 docs/12；同 v1.1，略）
 
 
 ## 5. 现有模块映射（从 → 到）
@@ -255,12 +269,12 @@ class Ecology:
   - 新增 `QD_USE_OO=1` 开关，默认关闭；冒烟测试通过。
 
 - 阶段 1（配置/参数/状态固化，2–3 天）
-  - 实装 `SimConfig/ParamsRegistry/WorldState`，由环境变量解析；
+  - 实装 `SimConfig/ParamsRegistry/WorldState`，由环境变量解析（Pydantic 校验）；
   - 旧模块读 env → 改读 world.config/params（通过适配）；
   - 输出元数据与 schema_version 注入 restart。
 
 - 阶段 2（Forcing/Physics 纯函数化，2–4 天）
-  - 将短波/长波/BL/Teq/反照率组合器从过程调用改为纯函数模块（保留原逻辑）；
+  - 将短波/长波/BL/Teq/反照率组合器从过程调用改为纯函数模块（保留原逻辑，JAX‑First 编写）；
   - Atmosphere/Surface/Ocean 改为仅组织调用 + 写入 state。
 
 - 阶段 3（Atmosphere/Ocean 子系统内收，4–7 天）
@@ -289,7 +303,7 @@ class Ecology:
 - 与旧格式兼容：load() 优先尝试新 schema，否则读取旧字段 + 构造缺省 group；打印黄色兼容日志。
 
 
-## 9. 测试矩阵与验收标准
+## 9. 测试矩阵与验收标准（v1.2 补充 DI/Mock 场景）
 
 - 单元（pytest/numba-free）：
   - numerics：laplacian, hyperdiffuse, shapiro（谱/空间一致性）
@@ -297,97 +311,87 @@ class Ecology:
   - hydrology_core：相态 Sigmoid、SWE/melt 守恒
   - ecology_core：带积分能量/反射与聚合限幅
   - io：schema 读写/迁移/原子写容错
-
 - 契约（contract tests）：
+  - façade vs 目标类签名一致性测试（反射比对）
   - 子系统 API：Atmosphere/Ocean/Hydrology/Routing/Ecology 的输入/输出字段与副作用范围
   - Forcing：给定 time/params，输出 I/I_b 的确定性（对随机种子固定）
-
 - 回归（integration/regression）：
-  - 选定基线运行片段（地形相同、随机种子固定），比较：
-    - 能量闭合：|⟨TOA_net⟩|、|⟨SFC_net⟩|、|⟨ATM_net⟩| < 2 W/m²（docs/06）
-    - 潜热一致：⟨LH⟩（SFC）≈ ⟨LH_release⟩（ATM）
-    - 水量闭合：⟨E⟩ ≈ ⟨P⟩ + ⟨R⟩（docs/09）
-  - 图像 Golden：状态图/TrueColor/OceanColor 结构差异（SSIM 或结构指标）不过阈
-
+  - 基线片段对比：能量闭合、潜热一致、水量闭合；图像 Golden（SSIM）
 - 性能：
   - 步时统计：OO 开关前后 Δt_step 在 ±5% 内；内存峰值不高于 +10%
-  - JAX 路径可选：CPU 下降 ≥ 30%（目标），GPU/TPU 更佳
-
-- 通过标准（本阶段验收）：
-  - OO 开关启用下端到端运行稳定（日尺度、年尺度）；
-  - 守恒指标满足 docs/06/08/09，且对比旧路径不劣化；
-  - 脚本与 README 中示例全部可复现。
+  - JAX 路径（可选）：CPU 单步下降 ≥ 30%（目标），GPU/TPU 更佳
+- DI/Mock：
+  - 利用依赖注入，将 `QingdaiWorld` 注入“伪造 Atmosphere/Ocean”等子系统，隔离测试单一模块的行为与边界条件响应。
 
 
-## 10. 性能与内存策略
+## 10. 性能与内存策略（JAX‑First 强调）
 
 - 禁止重复分配：状态数组在 WorldState 内创建，子系统拿视图/引用；纯函数返回写入目标数组（out 参数）。
 - IO 分批：大数组按需序列化；诊断分辨率/频率可降采样。
-- JAX 与 Numpy 共存：`jax_compat.xp` 统一算子；绘图/NetCDF 前显式 `np.asarray`。
-- 计算图粒度：将小函数合入大核（如 combined radiation）降低 Python 开销。
+- **JAX‑First**：核心算子以纯函数方式实现，禁用隐式全局状态；可选 `xp=jax.numpy` 后端；绘图/NetCDF 前显式 `np.asarray`。
+- 计算图粒度：将小函数合入大核（如 combined radiation）降低 Python 调度开销。
+- 值语义 + in‑place 的平衡：对外暴露值语义；内部在需要时安全地 in‑place 更新，再在返回前构造新 `WorldState`（builder/copy‑on‑write）。
 
 
-## 11. 最小代码骨架（可立即落地）
+## 11. 最小代码骨架（可立即落地，含 DI）
 
 ```python
 # pygcm/world/world.py
 class QingdaiWorld:
-    def __init__(self, config, params, grid, state=None):
+    def __init__(self, config, params, grid,
+                 atmos=None, ocean=None, surface=None, hydrology=None, routing=None, ecology=None, forcing=None,
+                 state=None):
         self.config, self.params, self.grid = config, params, grid
+        self.atmos = atmos or AtmosphereFacade(self)   # façade 与目标类签名一致
+        self.ocean = ocean or OceanFacade(self)
+        self.hydro = hydrology or HydrologyFacade(self)
+        self.route = routing or RoutingFacade(self)
+        self.eco = ecology or EcologyFacade(self)
+        self.forcing = forcing or ForcingFacade(self)
         self.state = state or self._alloc_initial_state()
-        # façades：旧模块的代理
-        self.atmos = AtmosphereFacade(self)
-        self.ocean  = OceanFacade(self)
-        self.hydro  = HydrologyFacade(self)
-        self.route  = RoutingFacade(self)
-        self.eco    = EcologyFacade(self)
-        self.forcing= ForcingFacade(self)
+
+    @classmethod
+    def create_default(cls, config=None, params=None, grid=None):
+        # 解析 env → SimConfig/ParamsRegistry（Pydantic 校验）
+        # 构造 Grid；构建默认子系统实例；分配初始状态
+        ...
 
     def step(self):
-        # 1) Forcing/precompute
+        # 以 builder 模式构造下一状态（值语义）
         self.forcing.update()
-        # 2) Atmos
         self.atmos.time_step()
-        # 3) Surface energy（含 SW/LW/SH/LH 与海冰）
-        #    可由 atmos/physics/surface 共同完成
-        # 4) Ocean
         if self.config.use_ocean:
             self.ocean.step()
-        # 5) Hydrology + Routing
         self.hydro.step()
         if self.config.use_routing:
             self.route.step()
-        # 6) Ecology（subdaily/daily）
         if self.config.use_ecology:
             self.eco.step_subdaily()
             if self._hits_day_boundary(): self.eco.step_daily()
-        # 7) Diag/Plot
         self._maybe_plot()
         self.state.t_seconds += self.config.dt_seconds
+        return self.state
 ```
 
-> 说明：Facade 初期直接调用旧模块函数，保证接入 0 风险；随后逐步替换为新类逻辑。
+> 说明：Facade 初期直接调用旧模块函数，保证接入 0 风险；随后逐步替换为新类逻辑。公开签名与目标类完全一致以履行“API 合约”。
 
 
 ## 12. 风险与对策
 
 - 风险：接口漂移导致产线中断  
-  对策：QD_USE_OO 守门；facade 先代理旧实现；阶段化回归测试。
-
+  对策：QD_USE_OO 守门；façade 与目标类签名一致；阶段化回归测试。
 - 风险：守恒退化  
   对策：每阶段引入“守恒回归”并将失败视为阻断；只在通过后推进。
-
 - 风险：性能下降  
-  对策：性能基准纳入每阶段退出标准；profiling 针对热点做回退或 JAX 化。
-
+  对策：性能基准纳入每阶段退出标准；profiling 针对热点做回退或 JAX 化；内外值语义平衡。
 - 风险：持久化不兼容  
-  对策：引入 schema_version 与迁移工具；保持旧格式读取路径与默认填充。
+  对策：引入 schema_version 与迁移工具；保持旧格式读取路径与默认填充；黄色兼容日志。
 
 
 ## 13. 时间表（建议）
 
-- Week 1：阶段 0–1（façade + 配置/参数/状态）；冒烟回归
-- Week 2：阶段 2（Forcing/Physics 纯函数化）；基线回归
+- Week 1：阶段 0–1（façade + 配置/参数/状态 Pydantic 校验）；冒烟回归
+- Week 2：阶段 2（Forcing/Physics 纯函数化，JAX‑First）；基线回归
 - Week 3：阶段 3（Atmosphere/Ocean 内收）；性能回归
 - Week 4：阶段 4（Hydrology/Routing/Ecology 对齐）；端到端年尺度试跑
 - Week 5：阶段 5（JAX 互操作 + 文档/示例/README 更新）
@@ -404,4 +408,5 @@ class QingdaiWorld:
 
 ## 15. 变更记录（Changelog）
 
+- 2025‑09‑27：v1.2 合入评审建议：Pydantic 校验、DI 依赖注入、Façade 即 API 合约、JAX‑First 强化；补充不可变状态策略与 Mock 测试用例建议。
 - 2025‑09‑27：v1.1 可落地蓝图：对象模型、API 合约、迁移阶段、测试矩阵、持久化 schema、性能策略与骨架代码；对齐 docs/12/04/06/07/08/09/10/11/14/15/16/18。
