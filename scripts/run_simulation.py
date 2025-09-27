@@ -792,6 +792,69 @@ def plot_ocean(grid, ocean, land_mask, t_days, output_dir):
     plt.close(fig)
 
 
+def plot_plankton_species(grid, phyto, land_mask, t_days, output_dir):
+    """
+    Save plankton species 0/1 density (mg Chl m^-3) maps to output/plankton/.
+    Note:
+    - This plot uses raw C_phyto_s (mg Chl m^-3) without any day/night (irradiance) weighting
+      or cloud/true-color overlays. Only land is masked to NaN for clarity.
+    - Optional env QD_PHYTO_VMAX can fix the upper color limit; otherwise uses 99th percentile.
+    """
+    import os as _os
+    import numpy as _np
+    import matplotlib.pyplot as _plt
+    try:
+        C = getattr(phyto, "C_phyto_s", None)  # shape [S, n_lat, n_lon]
+        if C is None or C.ndim != 3:
+            return
+        S = int(C.shape[0])
+        if S <= 0:
+            return
+        _os.makedirs(_os.path.join(output_dir, "plankton"), exist_ok=True)
+
+        land_bool = (land_mask == 1)
+
+        def _plot_one(spec_idx: int):
+            # Raw concentration; do NOT modulate by irradiance, clouds, or day/night.
+            field = C[spec_idx, :, :].astype(float).copy()
+            # Mask land to NaN so color scale reflects ocean values only.
+            field[land_bool] = _np.nan
+
+            # Determine color limits (vmin=0, vmax from env or 99th percentile of ocean values)
+            try:
+                vmax_env = _os.getenv("QD_PHYTO_VMAX")
+                if vmax_env is not None and vmax_env.strip() != "":
+                    vmax = float(vmax_env)
+                else:
+                    vmax = float(_np.nanpercentile(field, 99.0))
+            except Exception:
+                vmax = float(_np.nanmax(field))
+            if not _np.isfinite(vmax) or vmax <= 0.0:
+                vmax = 1.0e-3
+            vmin = 0.0
+            levels = _np.linspace(vmin, vmax, 21)
+
+            fig, ax = _plt.subplots(1, 1, figsize=(12, 5), constrained_layout=True)
+            cs = ax.contourf(grid.lon, grid.lat, field, levels=levels, cmap="viridis")
+            # Coastline
+            ax.contour(grid.lon, grid.lat, land_mask, levels=[0.5], colors="black", linewidths=0.6)
+            ax.set_title(f"Plankton species {spec_idx} (mg Chl m$^{{-3}}$) Day {t_days:.2f}")
+            ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+            ax.set_xlim(0, 360); ax.set_ylim(-90, 90)
+            cbar = fig.colorbar(cs, ax=ax, label="mg Chl m$^{-3}$")
+
+            fname = _os.path.join(output_dir, "plankton", f"species{spec_idx}_day_{t_days:05.1f}.png")
+            _plt.savefig(fname, dpi=140)
+            _plt.close(fig)
+
+        # Always plot species 0；若存在则再画 species 1
+        _plot_one(0)
+        if S >= 2:
+            _plot_one(1)
+    except Exception:
+        # Non-fatal: just skip visualization
+        pass
+
 def plot_isr_components(grid, gcm, t_days, output_dir):
     """
     Save a diagnostic figure showing per-star incoming shortwave (ISR) components
@@ -1247,29 +1310,15 @@ def main():
     elif PHYTO_ENABLED:
         print("[Phyto] Manager not available (import failed).")
 
-    # Load Phyto autosave if present; else initialize by env policy (random/default)
-    try:
-        if phyto is not None and int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1:
-            phy_path = os.path.join("data", "phyto_autosave.npz")
-            on_mismatch = "random" if int(os.getenv("QD_PHYTO_INIT_RANDOM", "0")) == 1 else "default"
-            if os.path.exists(phy_path):
-                ok = phyto.load_autosave(phy_path, on_mismatch=on_mismatch)
-                if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
-                    print(f"[Phyto] Load autosave {'OK' if ok else 'fallback'} (policy={on_mismatch}).")
-                if not ok:
-                    if on_mismatch == "random":
-                        phyto.randomize_state(seed=None)
-                    else:
-                        phyto.reset_default_state()
-            else:
-                # No autosave file: honor policy
-                if on_mismatch == "random":
-                    phyto.randomize_state(seed=None)
-                else:
-                    phyto.reset_default_state()
-    except Exception as _ple:
-        if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
-            print(f"[Phyto] Load/init policy failed: {_ple}")
+    # Phyto NPZ autosave deprecated:
+    # Initialization now relies on standardized files in data/:
+    #   - data/plankton.nc     (gridded distributions: C_phyto_s/alpha/Kd490/N)
+    #   - data/plankton.json   (bio/optics & bands parameters)
+    # See the section "Optional: load plankton bio/distribution on startup" below.
+    # To force randomized/default init, use:
+    #   QD_PHYTO_INIT_RANDOM=1  → randomize_state()
+    # Otherwise falls back to reset_default_state() via that block when no files are present.
+    pass
 
     # Optional: load plankton bio/distribution on startup (controlled by QD_LOAD_PLANKTON=1)
     try:
@@ -1319,7 +1368,7 @@ def main():
         print("[EcoIndiv] Module not available (import failed).")
 
     # --- Diversity diagnostics settings ---
-    DIVERSITY_ENABLED = int(os.getenv("QD_ECO_DIVERSITY_ENABLE", "1")) == 1
+    DIVERSITY_ENABLED = int(os.getenv("QD_ECO_DIVERSITY_ENABLE", "0")) == 1
     try:
         DIVERSITY_EVERY_DAYS = float(os.getenv("QD_ECO_DIVERSITY_EVERY_DAYS", "10"))
     except Exception:
@@ -2146,6 +2195,13 @@ def main():
             # Plot instantaneous precipitation rate (kg m^-2 s^-1 ⇒ mm/day)
             plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean, routing=routing)
             plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing, eco=eco, phyto=phyto)
+            # Optional: plankton species maps (species 0/1) when enabled
+            if phyto is not None and int(os.getenv("QD_PLOT_PHYTO", "0")) == 1:
+                try:
+                    plot_plankton_species(grid, phyto, land_mask, t_days, output_dir)
+                except Exception as _pp:
+                    if int(os.getenv("QD_PHYTO_DIAG", "1")) == 1:
+                        print(f"[PlanktonViz] skipped: {_pp}")
             # Ecology panel: always output (with placeholders if eco is None)
             try:
                 lai_map = None
@@ -2177,17 +2233,19 @@ def main():
                         if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                             print(f"[Ecology] Panel fallback: banded alpha computed from {Abands_now.shape[0]} bands.")
                 band_ok = (last_alpha_banded is not None)
-                plot_ecology(
-                    grid, land_mask, t_days, output_dir,
-                    lai=lai_map,
-                    alpha_ecology=last_alpha_ecology_map,
-                    alpha_banded=(last_alpha_banded if band_ok else None),
-                    canopy_height=ch_map,
-                    species_density=sd_maps
-                )
+                # Ecology panel: gated by QD_ECO_PLOT (default off)
+                if int(os.getenv("QD_ECO_PLOT", "1")) == 1:
+                    plot_ecology(
+                        grid, land_mask, t_days, output_dir,
+                        lai=lai_map,
+                        alpha_ecology=last_alpha_ecology_map,
+                        alpha_banded=(last_alpha_banded if band_ok else None),
+                        canopy_height=ch_map,
+                        species_density=sd_maps
+                    )
                 # Optional: auto-open ecology panel on macOS at first plot
                 try:
-                    if sys.platform == "darwin" and int(os.getenv("QD_ECO_OPEN", "1")) == 1 and i == 0:
+                    if sys.platform == "darwin" and int(os.getenv("QD_ECO_PLOT", "1")) == 1 and int(os.getenv("QD_ECO_OPEN", "0")) == 1 and i == 0:
                         panel_path = os.path.join(output_dir, f"ecology_day_{t_days:05.1f}.png")
                         os.system(f"open '{panel_path}'")
                 except Exception:

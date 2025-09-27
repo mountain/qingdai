@@ -340,7 +340,8 @@ Shapiro 与谱带阻：
 
 诊断与可视化
 - QD_ECO_DIAG（默认 1）：生态诊断打印（EcologyDiag）与可选图层。  
-- QD_ECO_OPEN（默认 1）：macOS 下首次绘图自动打开生态面板（ecology_day_*.png）。  
+- QD_ECO_PLOT（默认 0）：生态面板出图开关（ecology_day_*.png）。设为 1 时随 QD_PLOT_EVERY_DAYS 频率输出。  
+- QD_ECO_OPEN（默认 0）：macOS 下首次绘图自动打开生态面板（需 QD_ECO_PLOT=1）。  
 - QD_ECO_BANDS_COUPLE（默认 0）：启用带化反照率与短波耦合（日级降维混入）。  
 - QD_ECO_TRUECOLOR_VEG（默认 1）：TrueColor 植被颜色叠加（按带反射与日/夜/I_b 调制）。  
 - QD_ECO_VEG_MIX_EXP（默认 1.3）：TrueColor 叠加时对冠层因子 f(LAI) 的指数强化，提升高 LAI 时的“绿度主导感”。  
@@ -359,6 +360,7 @@ Shapiro 与谱带阻：
 - QD_PHYTO_ALBEDO_COUPLE（默认 1）：将海色标量 α_water 写回短波  
 - QD_PHYTO_FEEDBACK_MODE（daily|instant，默认 daily）  
 - QD_PHYTO_ADVECTION（默认 1）：启用海流平流/扩散  
+- QD_PLOT_PHYTO（默认 0）：输出浮游生物物种分布 PNG（species 0/1）至 output/plankton/，文件名如 species0_day_00010.0.png（频率由 QD_PLOT_EVERY_DAYS 控制）。  
 - QD_PHYTO_KH（默认=QD_KH_OCEAN 或 5e3 m²/s）：水平扩散系数  
 
 光学带设置  
