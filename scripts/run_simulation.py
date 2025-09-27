@@ -1886,7 +1886,7 @@ def main():
         gcm.cloud_cover = np.clip(gcm.cloud_cover, 0.0, 1.0)
 
         # Optional: advect cloud as a tracer to reduce stickiness (experimental)
-        if int(os.getenv("QD_CLOUD_ADVECT", "0")) == 1:
+        if int(os.getenv("QD_CLOUD_ADVECT", "1")) == 1:
             try:
                 adv_alpha = float(os.getenv("QD_CLOUD_ADV_ALPHA", "0.7"))
             except Exception:
@@ -1895,9 +1895,9 @@ def main():
                 cloud_adv = _advect_scalar_periodic(gcm.cloud_cover, gcm.u, gcm.v, dt, grid)
                 # Optional smoothing after advection
                 try:
-                    sig = float(os.getenv("QD_CLOUD_SMOOTH_SIGMA", "0.0"))
+                    sig = float(os.getenv("QD_CLOUD_SMOOTH_SIGMA", "0.2"))
                 except Exception:
-                    sig = 0.0
+                    sig = 0.2
                 if sig > 0.0:
                     try:
                         from scipy.ndimage import gaussian_filter
@@ -2401,7 +2401,7 @@ def main():
             plot_state(grid, gcm, land_mask, precip, gcm.cloud_cover, albedo, t_days, output_dir, ocean=ocean, routing=routing)
             plot_true_color(grid, gcm, land_mask, t_days, output_dir, routing=routing, eco=eco, phyto=phyto)
             # Optional: plankton species maps (species 0/1) when enabled
-            if phyto is not None and int(os.getenv("QD_PLOT_PHYTO", "0")) == 1:
+            if phyto is not None and int(os.getenv("QD_PLOT_PHYTO", "1")) == 1:
                 try:
                     plot_plankton_species(grid, phyto, land_mask, t_days, output_dir)
                 except Exception as _pp:

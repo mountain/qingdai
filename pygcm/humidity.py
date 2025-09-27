@@ -45,7 +45,7 @@ class HumidityParams:
 
     # Surface evaporation scaling by type
     ocean_evap_scale: float = 1.0
-    land_evap_scale: float = 0.2
+    land_evap_scale: float = 0.5
     ice_evap_scale: float = 0.05
 
     # Microphysics/relaxation
@@ -75,7 +75,7 @@ def get_humidity_params_from_env() -> HumidityParams:
         L_v=_f("QD_LV", 2.5e6),
         p0=_f("QD_P0", 1.0e5),
         ocean_evap_scale=_f("QD_OCEAN_EVAP_SCALE", 1.0),
-        land_evap_scale=_f("QD_LAND_EVAP_SCALE", 0.2),
+        land_evap_scale=_f("QD_LAND_EVAP_SCALE", 0.5),
         ice_evap_scale=_f("QD_ICE_EVAP_SCALE", 0.05),
         tau_cond=_f("QD_TAU_COND", 1800.0),
         diag=(_i("QD_HUMIDITY_DIAG", 1) == 1),

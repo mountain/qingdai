@@ -245,7 +245,7 @@ class PhytoManager:
             dtype=float
         )
         # Remineralization source (mmol m^-3 d^-1) and initial N
-        self.R_remin = _read_env_float("QD_PHYTO_REMIN", 0.0)
+        self.R_remin = _read_env_float("QD_PHYTO_REMIN", 0.01)
         N_init = _read_env_float("QD_PHYTO_N_INIT", 1.0)
         self.N = np.full((self.NL, self.NM), N_init, dtype=float)
         self.N[~self.ocean_mask] = 0.0
