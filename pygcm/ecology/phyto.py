@@ -150,11 +150,11 @@ class PhytoManager:
         self.H_mld = float(max(0.1, H_mld_m))
 
         # Number of species (default 1; set to 10 to enable ten types)
-        S_default = 1
+        S_default = 10
         try:
-            S_default = int(os.getenv("QD_PHYTO_NSPECIES", "1"))
+            S_default = int(os.getenv("QD_PHYTO_NSPECIES", "10"))
         except Exception:
-            S_default = 1
+            S_default = 10
         self.S = max(1, S_default)
 
         # Optical base parameters per band (Kd and pure water reflectance)
@@ -230,6 +230,25 @@ class PhytoManager:
             [(m0_arr[s] if s < len(m0_arr) else self.params.m0) for s in range(self.S)],
             dtype=float
         )
+
+        # --- Nutrient competition (optional, single N pool) ---
+        self.enable_N = int(os.getenv("QD_PHYTO_ENABLE_N", "1")) == 1
+        # Per-species half-saturation (mmol m^-3) and yield (mg Chl per mmol N)
+        KN_list = _read_env_list("QD_PHYTO_KN") or []
+        Y_list  = _read_env_list("QD_PHYTO_YIELD") or []
+        self.KN_s = np.array(
+            [(KN_list[s] if s < len(KN_list) else 0.5) for s in range(self.S)],
+            dtype=float
+        )
+        self.Y_s = np.array(
+            [(Y_list[s] if s < len(Y_list) else 1.0) for s in range(self.S)],
+            dtype=float
+        )
+        # Remineralization source (mmol m^-3 d^-1) and initial N
+        self.R_remin = _read_env_float("QD_PHYTO_REMIN", 0.0)
+        N_init = _read_env_float("QD_PHYTO_N_INIT", 1.0)
+        self.N = np.full((self.NL, self.NM), N_init, dtype=float)
+        self.N[~self.ocean_mask] = 0.0
 
         # Species initial fractions (sum to 1); if not provided, equal split
         frac_arr = _read_env_list("QD_PHYTO_INIT_FRAC") or []
@@ -336,19 +355,37 @@ class PhytoManager:
         Kd_b = self._kd_bands(C_tot)
         Ibar_b = self._Ibar_bands_in_mld(I_b_surf, Kd_b)
 
-        # 3) PAR proxy: sum over bands
-        I_PAR = np.sum(Ibar_b, axis=0)  # [NL, NM]
+        # 3) Species‑specific light proxy via band integration:
+        #    E_s = Σ_b Ī_b · Shape_s[b] · Δλ_b (if available)  → drives spectral light limitation
+        try:
+            dlam = np.asarray(self.bands.delta_lambda, dtype=float)
+        except Exception:
+            dlam = None
+        if dlam is not None and dlam.size == self.bands.nbands:
+            E_s = np.tensordot(self.shape_sb, Ibar_b * dlam[:, None, None], axes=(1, 0))  # [S, NL, NM]
+        else:
+            E_s = np.tensordot(self.shape_sb, Ibar_b, axes=(1, 0))  # [S, NL, NM]
 
-        # 4) Growth modifiers
-        muL = np.tanh(self.params.alpha_P * I_PAR / max(1e-6, float(np.max(self.mu_max_s))))
+        # 4) Growth modifiers: species light limitation (tanh) and shared temperature factor (Q10)
+        #    Note: Divide by μ_max_s per species to keep tanh argument scale consistent.
+        muL_s = np.tanh(self.params.alpha_P * E_s / np.maximum(self.mu_max_s[:, None, None], 1e-6))
         fT = np.power(self.params.Q10, (np.asarray(T_w, dtype=float) - self.params.T_ref) / 10.0)
 
-        # 5) Net specific rate per SPECIES (d^-1)
+        # 5) Net specific rate per SPECIES (d^-1): μ_s = μ_max_s · muL_s · fT − (m0_s + sink/H)
         sink_term = 0.0
         if self.params.lambda_sink_m_per_day > 0.0:
             sink_term = float(self.params.lambda_sink_m_per_day) / max(1e-6, self.H_mld)
-        # Broadcast to [S, NL, NM]
-        mu_s = (self.mu_max_s[:, None, None] * muL[None, :, :] * fT[None, :, :]) - (self.m0_s[:, None, None] + sink_term)
+
+        # Nutrient limitation and growth split
+        if self.enable_N:
+            KN = np.maximum(self.KN_s[:, None, None], 1e-12)  # [S,1,1]
+            Nmap = np.asarray(self.N, dtype=float)[None, :, :]  # [1,NL,NM]
+            fN_s = Nmap / (KN + Nmap)  # [S,NL,NM] in [0,1]
+            mu_grow_s = self.mu_max_s[:, None, None] * muL_s * fT[None, :, :] * np.clip(fN_s, 0.0, 1.0)
+        else:
+            mu_grow_s = self.mu_max_s[:, None, None] * muL_s * fT[None, :, :]
+
+        mu_s = mu_grow_s - (self.m0_s[:, None, None] + sink_term)
 
         # 6) Update chlorophyll per species
         dC_s = mu_s * self.C_phyto_s * float(dt_days)
@@ -356,6 +393,16 @@ class PhytoManager:
         # Keep land cells at zero
         for s in range(self.S):
             self.C_phyto_s[s, ~self.ocean_mask] = 0.0
+
+        # Nutrient update (mmol m^-3)
+        if self.enable_N:
+            Y = np.maximum(self.Y_s[:, None, None], 1e-12)  # [S,1,1]
+            # Uptake = μ_grow · C / Y  (mmol m^-3 d^-1)
+            uptake = (mu_grow_s * self.C_phyto_s) / Y
+            total_uptake = np.sum(uptake, axis=0)  # [NL,NM]
+            dN = (- total_uptake + float(self.R_remin)) * float(dt_days)
+            self.N = np.clip(np.asarray(self.N, dtype=float) + dN, 0.0, np.inf)
+            self.N[~self.ocean_mask] = 0.0
 
         # 7) Update optics → water albedo maps from species mixture
         alpha_b = self._alpha_bands_from_species(self.C_phyto_s)  # [NB, NL, NM]
@@ -529,6 +576,7 @@ class PhytoManager:
                 mu_max_s=np.asarray(self.mu_max_s, dtype=np.float32),
                 m0_s=np.asarray(self.m0_s, dtype=np.float32),
                 init_frac_s=np.asarray(self.init_frac_s, dtype=np.float32),
+                N=np.asarray(self.N, dtype=np.float32),
             )
             if self.diag:
                 print(f"[Phyto] Autosave written: '{path_npz}' (S={self.S}, NL={self.NL}, NM={self.NM})")
@@ -579,6 +627,16 @@ class PhytoManager:
             # Respect ocean mask (land=0)
             for s in range(self.S):
                 self.C_phyto_s[s, ~self.ocean_mask] = 0.0
+            # Optional: load nutrient pool if present
+            try:
+                N_saved = data.get("N")
+                if N_saved is not None:
+                    N_arr = np.asarray(N_saved, dtype=float)
+                    if N_arr.shape == (self.NL, self.NM):
+                        self.N = np.clip(N_arr, 0.0, np.inf)
+                        self.N[~self.ocean_mask] = 0.0
+            except Exception:
+                pass
             if self.diag:
                 print(f"[Phyto] Autosave loaded: '{path_npz}' (S={S}, NL={NL}, NM={NM})")
             return True
@@ -716,6 +774,13 @@ class PhytoManager:
                 # Kd(490)
                 vk = ds.createVariable("Kd_490", "f4", ("lat", "lon"))
                 vk[:] = np.asarray(self.Kd_490, dtype=np.float32)
+
+                # Nutrient pool (optional)
+                try:
+                    vN = ds.createVariable("N", "f4", ("lat", "lon"))
+                    vN[:] = np.asarray(self.N, dtype=np.float32)
+                except Exception:
+                    pass
 
                 # Band centers (for reference)
                 vb = ds.createVariable("bands_lambda_centers", "f4", ("band",))

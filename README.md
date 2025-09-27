@@ -118,6 +118,7 @@
 11. 开发者指南/代码架构与 API（P002 + 实现）：[docs/12-code-architecture-and-apis.md](./docs/12-code-architecture-and-apis.md)（参见 [projects/002](./projects/002-physics-core.md)）
 12. 地表水文与径流路由（P014）：[projects/014-surface-hydrology.md](./projects/014-surface-hydrology.md)（运行参数见 [docs/04-runtime-config.md](./docs/04-runtime-config.md) 第 10 节）
 13. 项目状态与进展对齐（2025‑09‑26）：[docs/STATUS-2025-09-26.md](./docs/STATUS-2025-09-26.md)
+14. 地形递减率与雪线/雪被（P019）：[docs/18-orography-lapse-and-snowpack.md](./docs/18-orography-lapse-and-snowpack.md)（设计与任务见 [projects/019](./projects/019-orography-lapse-and-snowpack.md)）
 
 ## 🤝 贡献
 

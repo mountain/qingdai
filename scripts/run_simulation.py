@@ -233,9 +233,9 @@ def load_ocean(path: str) -> dict:
 def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, eco, day_value: float) -> None:
     """
     Save autosave checkpoint into data/:
-      - data/restart_autosave.nc   (core model state via NetCDF)
-      - data/eco_autosave.npz      (ecology extended state if available; fallback to LAI/species_weights)
-      - data/species_autosave.json (light species info: weights; optional)
+      - data/atmosphere.nc   (core model state via NetCDF, includes t_seconds epoch)
+      - data/ecology.nc      (ecology extended state via NetCDF: LAI/species_weights/species reflectance/bands)
+      - data/genes.json      (species genes snapshot with band weights)
     """
     try:
         os.makedirs(data_dir, exist_ok=True)
@@ -256,39 +256,27 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
     # Ecology (extended if possible, fallback to legacy)
     try:
         if eco is not None and getattr(eco, "pop", None) is not None:
-            # Resolve autosave path (allow override by env)
+            # Resolve autosave path (allow override by env, enforce NetCDF target)
             path_env = os.getenv("QD_ECO_AUTOSAVE_PATH")
-            path_npz = path_env if path_env else os.path.join(data_dir, "ecology.nc")
+            path_ec = path_env if (path_env and path_env.lower().endswith(".nc")) else os.path.join(data_dir, "ecology.nc")
             # Ensure directory exists for custom path
             try:
-                os.makedirs(os.path.dirname(path_npz) or ".", exist_ok=True)
+                os.makedirs(os.path.dirname(path_ec) or ".", exist_ok=True)
             except Exception:
                 pass
-            # Prefer adapter's extended autosave (bands/weights/species reflectance), fallback to legacy LAI-only
-            ok = False
+            # Write extended ecology state via adapter (NetCDF)
             try:
                 if hasattr(eco, "save_autosave"):
-                    ok = bool(eco.save_autosave(path_npz, day_value=float(day_value)))
+                    ok = bool(eco.save_autosave(path_ec, day_value=float(day_value)))
+                    if not ok:
+                        print(f"[Autosave] Ecology extended save returned False for '{path_ec}'")
+                else:
+                    print("[Autosave] Ecology adapter has no save_autosave; skipping ecology.nc")
+                    ok = False
             except Exception as _esa:
-                print(f"[Autosave] Ecology extended save failed (falling back): {_esa}")
+                print(f"[Autosave] Ecology extended save failed: {_esa}")
                 ok = False
-            if not ok:
-                # Legacy fallback: LAI + species_weights + light JSON weights
-                LAI_tot = eco.pop.total_LAI() if hasattr(eco.pop, "total_LAI") else getattr(eco.pop, "LAI", None)
-                w = np.asarray(getattr(eco.pop, "species_weights", []), dtype=float)
-                np.savez(path_npz, LAI=LAI_tot, species_weights=w)
-                print(f"[Autosave] Ecology legacy state saved to '{path_npz}'")
-                # Optional light JSON for species weights (genes exported elsewhere)
-                try:
-                    sp_json = os.path.join(data_dir, "species_autosave.json")
-                    with open(sp_json, "w", encoding="utf-8") as f:
-                        json.dump(
-                            {"day": float(day_value), "species_weights": w.tolist()},
-                            f, ensure_ascii=False, indent=2
-                        )
-                except Exception:
-                    pass
-            # Also write standardized genes.json alongside ecology state (best-effort)
+            # Always attempt to write genes.json alongside ecology state (best-effort)
             try:
                 if hasattr(eco, "save_genes_json"):
                     eco.save_genes_json(os.path.join(data_dir, "genes.json"), day_value=float(day_value))
@@ -298,50 +286,7 @@ def save_autosave(data_dir: str, grid, gcm, ocean, land_mask, W_land, S_snow, ec
         print(f"[Autosave] Ecology save failed: {e}")
 
 
-def load_eco_autosave(eco, path_npz: str) -> bool:
-    """
-    Load ecology autosave (LAI & species weights) into the running adapter.
-    Rebuilds layered LAI arrays for (S,K,lat,lon) from a total LAI map and species weights.
-    Returns True if loaded successfully.
-    """
-    if eco is None or getattr(eco, "pop", None) is None:
-        return False
-    try:
-        data = np.load(path_npz)
-        LAI = np.asarray(data.get("LAI"))
-        w = np.asarray(data.get("species_weights"))
-        pop = eco.pop
-        # Basic shape check
-        if LAI is None or LAI.shape != pop.shape:
-            return False
-        # Set species weights (normalize if needed)
-        if w is not None and w.size > 0:
-            w = np.clip(w, 0.0, None)
-            s = float(np.sum(w))
-            pop.species_weights = (w / s) if s > 0 else np.full((max(1, w.size),), 1.0 / max(1, w.size), dtype=float)
-            pop.Ns = int(pop.species_weights.shape[0])
-        else:
-            # Fallback single species
-            pop.species_weights = np.asarray([1.0], dtype=float)
-            pop.Ns = 1
-        # Set total LAI and rebuild layered SK tensors by equal split over K and by species weights
-        pop.LAI = np.clip(LAI, 0.0, pop.params.lai_max)
-        K = int(getattr(pop, "K", 1))
-        S = int(getattr(pop, "Ns", 1))
-        H, W = pop.shape
-        pop.LAI_layers_SK = np.zeros((S, K, H, W), dtype=float)
-        for s_idx in range(S):
-            frac_s = float(pop.species_weights[s_idx]) if S > 0 else 1.0
-            for k in range(K):
-                pop.LAI_layers_SK[s_idx, k, :, :] = frac_s * (pop.LAI / float(max(1, K)))
-        pop.LAI_layers = np.sum(pop.LAI_layers_SK, axis=0)
-        if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
-            sdiag = pop.summary()
-            print(f"[Ecology] Autosave loaded: LAI(min/mean/max)={sdiag['LAI_min']:.2f}/{sdiag['LAI_mean']:.2f}/{sdiag['LAI_max']:.2f}; S={S}, K={K}")
-        return True
-    except Exception as e:
-        print(f"[Ecology] Autosave load failed: {e}")
-        return False
+# (legacy NPZ loader removed; ecology persistence now uses NetCDF via EcologyAdapter.load_autosave and genes.json)
 
 
 def apply_banded_initial_ts(grid, gcm, ocean, land_mask):
@@ -1086,6 +1031,37 @@ def _try_autogen_hydro_network(grid, land_mask, elevation, topo_nc, out_path) ->
         return False
 
 
+# --- Optional: scalar advection helper for periodic lat-lon (cloud/diagnostics) ---
+def _advect_scalar_periodic(field, u, v, dt, grid):
+    """
+    Semi-Lagrangian advection on regular lat-lon with longitudinal periodicity.
+    Uses scipy.ndimage.map_coordinates; wraps in longitude (periodic). Latitude is approximated.
+    """
+    import numpy as _np
+    try:
+        from scipy.ndimage import map_coordinates, gaussian_filter  # noqa: F401 (gaussian optional)
+    except Exception:
+        from scipy.ndimage import map_coordinates  # type: ignore
+
+    a = getattr(grid, "a", 6.371e6)
+    dlat = grid.dlat_rad
+    dlon = grid.dlon_rad
+    coslat = _np.maximum(_np.cos(_np.deg2rad(grid.lat_mesh)), 0.5)
+
+    # Convert velocities to grid displacement in index space
+    dlam = u * dt / (a * coslat)
+    dphi = v * dt / a
+    dx = dlam / dlon
+    dy = dphi / dlat
+
+    JJ, II = _np.meshgrid(_np.arange(grid.n_lat), _np.arange(grid.n_lon), indexing="ij")
+    dep_J = JJ - dy
+    dep_I = II - dx
+
+    adv = map_coordinates(field, [dep_J, dep_I], order=1, mode="wrap", prefilter=False)
+    return adv
+
+
 def main():
     """
     Main function to run the simulation.
@@ -1384,12 +1360,19 @@ def main():
                 except Exception as _egl:
                     if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                         print(f"[Ecology] genes autosave load skipped: {_egl}")
-            # Try to load ecology autosave (optional, persists LAI/species weights)
+            # Try to load ecology autosave (optional, persists LAI/species weights & species bands)
             if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
                 try:
-                    eco_npz = os.path.join("data", "ecology.nc")
-                    if os.path.exists(eco_npz):
-                        _ = load_eco_autosave(eco, eco_npz)
+                    eco_path = os.getenv("QD_ECO_AUTOSAVE_PATH") or os.path.join("data", "ecology.nc")
+                    if os.path.exists(eco_path):
+                        ok_eco = False
+                        if hasattr(eco, "load_autosave"):
+                            ok_eco = bool(eco.load_autosave(eco_path, on_mismatch=os.getenv("QD_ECO_ON_MISMATCH", "fallback")))
+                        else:
+                            if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                                print("[Ecology] adapter has no load_autosave; cannot load ecology.nc")
+                        if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                            print(f"[Ecology] autosave load {'OK' if ok_eco else 'failed'} from '{eco_path}'")
                 except Exception as _ecl:
                     if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                         print(f"[Ecology] autosave load skipped: {_ecl}")
@@ -1472,11 +1455,22 @@ def main():
             except Exception as _egl:
                 if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
                     print(f"[Ecology] genes autosave load skipped: {_egl}")
-        # Try to load ecology autosave (optional)
+        # Try to load ecology autosave (optional; NetCDF preferred, JSON genes loaded earlier)
         if int(os.getenv("QD_AUTOSAVE_LOAD", "1")) == 1 and eco is not None:
-            eco_npz = os.path.join("data", "ecology.nc")
-            if os.path.exists(eco_npz):
-                _ = load_eco_autosave(eco, eco_npz)
+            try:
+                eco_path = os.getenv("QD_ECO_AUTOSAVE_PATH") or os.path.join("data", "ecology.nc")
+                if os.path.exists(eco_path):
+                    ok_eco = False
+                    if hasattr(eco, "load_autosave"):
+                        ok_eco = bool(eco.load_autosave(eco_path, on_mismatch=os.getenv("QD_ECO_ON_MISMATCH", "fallback")))
+                    else:
+                        if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                            print("[Ecology] adapter has no load_autosave; cannot load ecology.nc")
+                    if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                        print(f"[Ecology] autosave load {'OK' if ok_eco else 'failed'} from '{eco_path}'")
+            except Exception as _ecl:
+                if int(os.getenv("QD_ECO_DIAG", "1")) == 1:
+                    print(f"[Ecology] autosave load skipped: {_ecl}")
 
     # --- Simulation Parameters ---
     dt = int(os.getenv("QD_DT_SECONDS", "300"))  # default 300s
@@ -1764,6 +1758,32 @@ def main():
             gcm.cloud_cover = np.maximum(gcm.cloud_cover, cloud_floor)
 
         gcm.cloud_cover = np.clip(gcm.cloud_cover, 0.0, 1.0)
+
+        # Optional: advect cloud as a tracer to reduce stickiness (experimental)
+        if int(os.getenv("QD_CLOUD_ADVECT", "0")) == 1:
+            try:
+                adv_alpha = float(os.getenv("QD_CLOUD_ADV_ALPHA", "0.7"))
+            except Exception:
+                adv_alpha = 0.7
+            try:
+                cloud_adv = _advect_scalar_periodic(gcm.cloud_cover, gcm.u, gcm.v, dt, grid)
+                # Optional smoothing after advection
+                try:
+                    sig = float(os.getenv("QD_CLOUD_SMOOTH_SIGMA", "0.0"))
+                except Exception:
+                    sig = 0.0
+                if sig > 0.0:
+                    try:
+                        from scipy.ndimage import gaussian_filter
+                        cloud_adv = gaussian_filter(cloud_adv, sigma=sig, mode="wrap")
+                    except Exception:
+                        pass
+                gcm.cloud_cover = np.clip((1.0 - adv_alpha) * gcm.cloud_cover + adv_alpha * cloud_adv, 0.0, 1.0)
+                if i == 0:
+                    print(f"[CloudAdvect] enabled: ADV_ALPHA={adv_alpha:.2f}, SMOOTH_SIGMA={sig}")
+            except Exception as _cae:
+                if i == 0:
+                    print(f"[CloudAdvect] skipped: {_cae}")
 
         # 2) Forcing Step (moved earlier for ecology coupling): compute insolation components
         insA, insB = forcing.calculate_insolation_components(t)

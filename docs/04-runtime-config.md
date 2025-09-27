@@ -14,8 +14,10 @@
 6) 水循环闭合（P009）  
 7) 动力学反噪与滤波（P010）  
 8) 可视化与诊断（绘图/日志）  
-9) 自旋与重启（P013）
-10) 路由与湖泊（P014）
+9) 自旋与重启（P013）  
+10) 路由与湖泊（P014）  
+11) 生态模块（P015）  
+12) 浮游生物与海色（P017）
 
 ---
 
@@ -43,6 +45,10 @@
 - QD_USE_TOPO_ALBEDO（默认 1）：使用外部 `base_albedo` 融合云/冰的动态反照率  
 - QD_OROG（默认 0）：启用地形降水增强（迎风抬升）  
 - QD_OROG_K（默认 7e-4）：地形抬升强度系数（单位量纲与风/坡度近似匹配，建议微调）
+- 地形气温递减（P019：lapse rate）
+  - QD_LAPSE_ENABLE（默认 1）：开启海拔温度递减
+  - QD_LAPSE_K_KPM（默认 6.5）：环境递减率 Γ（K/km）
+  - QD_LAPSE_KS_KPM（默认与上同）：地表温度修正的递减率 Γ_s（K/km）
 
 ---
 
@@ -138,7 +144,20 @@
 - QD_RUNOFF_TAU_DAYS（默认 10 天）陆面“桶”径流时标  
 - QD_WLAND_CAP（可选）桶容量（mm）  
 - QD_SNOW_THRESH（默认 273.15 K）雨/雪阈值  
-- QD_SNOW_MELT_RATE（默认 5 mm/day）融雪速率  
+- QD_SNOW_MELT_RATE（默认 5 mm/day）融雪速率
+- 雪被与融雪扩展（P019）
+  - QD_SNOW_T_BAND（默认 1.5 K）相态 Sigmoid 过渡半宽 ΔT
+  - QD_SWE_ENABLE（默认 1）开启雪被水库
+  - QD_SWE_INIT_MM（默认 0）初始 SWE（mm）
+  - QD_SWE_MAX_MM（可选）SWE 上限（mm，不设则无限）
+  - QD_SWE_REF_MM（默认 15）雪覆盖率 C_snow 的参考厚度（mm）
+  - QD_SNOW_ALBEDO_FRESH（默认 0.70）新雪反照率
+  - QD_SNOW_ALBEDO_OLD（默认 0.45）旧雪反照率下限
+  - QD_SNOW_ALBEDO_DECAY_DAYS（默认 10）雪龄反照率衰减时标（天）
+  - QD_SNOW_MELT_MODE（degree_day|constant，默认 degree_day）融雪模式
+  - QD_SNOW_DDF_MM_PER_K_DAY（默认 3.0）度日融雪系数（mm/K/day）
+  - QD_SNOW_MELT_TREF（默认 273.15 K）融雪起始温度
+  - QD_SNOW_FASTFLOW_FRAC（默认 0.0）融雪快流比例（0..1）
 - QD_WATER_DIAG（默认 1）水量闭合诊断打印
 
 ---
@@ -259,7 +278,7 @@ Shapiro 与谱带阻：
 双时序（时级/日级）生态接口，用于植被—辐射即时耦合与日级慢过程（形态投资、生命周期、繁殖/传播）。
 
 主控与步长
-- QD_ECO_ENABLE（默认 0）：开启/关闭生态模块（Plant/PopulationManager）。  
+- QD_ECO_ENABLE（默认 1）：开启/关闭生态模块（Plant/PopulationManager）。  
 - QD_ECO_DT_DAYS（默认 1.0）：生态日级更新步长（天），用于慢路径。  
 - QD_ECO_SUBDAILY_ENABLE（默认 1）：启用与物理步对齐的时级子步接口。  
 - QD_ECO_SUBSTEP_EVERY_NPHYS（默认 1）：每 N 个物理步调用一次时级子步。  
@@ -330,6 +349,75 @@ Shapiro 与谱带阻：
 - 时级接口：PopulationManager.step_subdaily 与 Plant.update_substep 仅累积“当日能量/小时胁迫”，不进行形态大跳转；反照率按缓存策略低频重算（配置见上）。  
 - 日级接口：PopulationManager.step_daily 与 Plant.update_one_day 执行“慢路径”（形态投资、生命周期更替、繁殖/传播/突变）并生成日末诊断。  
 - 反照率耦合：FEEDBACK_MODE=instant 时，时级返回的 A_b^surface 将立即写回短波，下一物理步生效；daily 时仅在日末写回。
+
+## 12) 浮游生物与海色（P017）
+
+主控与步长  
+- QD_PHYTO_ENABLE（默认 1）：开启浮游生物模块  
+- QD_PHYTO_NSPECIES（默认 10）：物种数 Ns  
+- QD_PHYTO_DT_DAYS（默认 1.0）：日级更新步长  
+- QD_PHYTO_ALBEDO_COUPLE（默认 1）：将海色标量 α_water 写回短波  
+- QD_PHYTO_FEEDBACK_MODE（daily|instant，默认 daily）  
+- QD_PHYTO_ADVECTION（默认 1）：启用海流平流/扩散  
+- QD_PHYTO_KH（默认=QD_KH_OCEAN 或 5e3 m²/s）：水平扩散系数  
+
+光学带设置  
+- QD_PHYTO_KD0 / QD_PHYTO_KD_CHL / QD_PHYTO_APURE：每带数组（长度 NB）；或使用默认  
+- QD_PHYTO_KD0_DEFAULT（默认 0.04）、QD_PHYTO_KD_CHL_DEFAULT（默认 0.02）、QD_PHYTO_APURE_DEFAULT（默认 0.06）  
+- QD_PHYTO_KD_EXP_M（默认 0.5）：Kd ~ Chl^m 的指数  
+- QD_OC_KD_BAND_REF_NM（默认 490）：Kd(490) 诊断参考波段（nm）
+
+物种光谱与反照率映射  
+- QD_PHYTO_SPEC_MU_NM：每物种 Gaussian 中心（nm）数组  
+- QD_PHYTO_SPEC_SIGMA_NM：每物种宽度（nm）数组（默认 70）  
+- QD_PHYTO_SPEC_C_REFLECT：每物种反照率系数 c（默认 0.02）  
+- QD_PHYTO_SPEC_P_REFLECT：每物种幂指数 p（默认 0.5）
+
+生理参数  
+- QD_PHYTO_SPEC_MU_MAX：每物种 μ_max（d⁻¹），列表  
+- QD_PHYTO_SPEC_M0：每物种 m0（d⁻¹），列表  
+- 共享默认：QD_PHYTO_ALPHA_P（默认 0.04）、QD_PHYTO_Q10（2.0）、QD_PHYTO_T_REF（293.15 K）、QD_PHYTO_M_LOSS（0.05 d⁻¹）、QD_PHYTO_LAMBDA_SINK（m d⁻¹）
+
+营养池（可选）  
+- QD_PHYTO_ENABLE_N（默认 1）：启用单营养盐池 N  
+- QD_PHYTO_KN：每物种半饱和 K_N（mmol m⁻³，默认 0.5）  
+- QD_PHYTO_YIELD：每物种 Y（mg Chl per mmol N，默认 1.0）  
+- QD_PHYTO_REMIN（mmol m⁻³ d⁻¹，默认 0.0）：再矿化源项  
+- QD_PHYTO_N_INIT（初始 N，默认 1.0）
+
+初始化与持久化  
+- QD_PHYTO_CHL0（总 Chl 初值，默认 0.05 mg/m³）  
+- QD_PHYTO_INIT_FRAC（物种初始权重列表，归一化后生效）  
+- QD_PHYTO_INIT_RANDOM（1 随机噪声初始化；0 确定性）  
+- autosave：data/phyto_autosave.npz（含 C_i 与 N），data/plankton.json（bio/optics），data/plankton.nc（分布）
+
+运行示例  
+- 仅诊断（不回写短波）：
+```bash
+export QD_PHYTO_ENABLE=1
+export QD_PHYTO_NSPECIES=10
+export QD_PHYTO_ALBEDO_COUPLE=0
+export QD_PLOT_OCEANCOLOR=1
+python3 -m scripts.run_simulation
+```
+- 回写短波（每日）：
+```bash
+export QD_PHYTO_ENABLE=1
+export QD_PHYTO_NSPECIES=10
+export QD_PHYTO_ALBEDO_COUPLE=1
+export QD_PHYTO_FEEDBACK_MODE=daily
+python3 -m scripts.run_simulation
+```
+- 启用营养池竞争 + 传输：
+```bash
+export QD_PHYTO_ENABLE=1
+export QD_PHYTO_ENABLE_N=1
+export QD_PHYTO_N_INIT=1.0
+export QD_PHYTO_REMIN=0.0
+export QD_PHYTO_ADVECTION=1
+export QD_PHYTO_KH=5000
+python3 -m scripts.run_simulation
+```
 
 # 参考
 
